@@ -1,0 +1,6 @@
+{
+  "uuid": "rclone-mounts-tasks@psark007.github.io",
+  "name": "Rclone Mounts & Tasks",
+  "description": "Manual Rclone mounts and copy/sync tasks; nothing runs on login.",
+  "shell-version": ["51"]
+}
