@@ -4,17 +4,27 @@
 import fcntl
 import json
 import os
-from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "gnome-shell-rclone"
 STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "gnome-shell-rclone"
-TASK_PORT = 5576
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "gnome-shell-rclone" / "mounts"
+FIRST_TASK_PORT = 5576
+TASK_HISTORY_LIMIT = 5
+RECOMMENDED_CACHE = {"mode": "full", "maxSize": "5G", "maxAge": "24h", "minFreeSpace": "10G"}
+LOG_LIMIT = 1024 * 1024
+LOG_TOTAL = 16 * 1024 * 1024
+RC_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class UserError(Exception):
@@ -52,6 +62,151 @@ def read_list(name):
         raise UserError(f"Invalid {name} definitions; refusing changes") from exc
 
 
+def logging_enabled():
+    path = CONFIG / "diagnostics.json"
+    if not path.exists():
+        return False
+    try:
+        value = json.loads(path.read_text())
+        if type(value.get("logging")) is not bool:
+            raise ValueError("invalid logging setting")
+        return value["logging"]
+    except (OSError, ValueError, AttributeError) as exc:
+        raise UserError("Invalid diagnostics settings") from exc
+
+
+def save_diagnostics(payload):
+    if type(payload.get("logging")) is not bool:
+        raise UserError("Diagnostic logging must be on or off")
+    write_json(CONFIG / "diagnostics.json", {"logging": payload["logging"]})
+    return {"message": "Logging setting saved; applies to new runs and mounts"}
+
+
+def validate_cache(cache):
+    if not isinstance(cache, dict) or set(cache) != set(RECOMMENDED_CACHE):
+        raise UserError("Enter all caching settings")
+    if cache["mode"] not in ("writes", "full"):
+        raise UserError("Choose Writes only or Reads and writes")
+    for key in ("maxSize", "minFreeSpace"):
+        value = cache[key]
+        if not isinstance(value, str) or not (value == "off" or re.fullmatch(r"[1-9][0-9]*[KMGT]", value)):
+            raise UserError(f"Invalid {key}; use e.g. 5G or off")
+        if value != "off" and int(value[:-1]) * 1024 ** ("KMGT".index(value[-1]) + 1) >= 2 ** 63:
+            raise UserError(f"{key} is too large")
+    if not isinstance(cache["maxAge"], str) or not re.fullmatch(r"[1-9][0-9]*[mhdw]", cache["maxAge"]):
+        raise UserError("Invalid cache age; use e.g. 24h or 7d")
+    if int(cache["maxAge"][:-1]) * {"m": 60, "h": 3600, "d": 86400, "w": 604800}[cache["maxAge"][-1]] > 36500 * 86400:
+        raise UserError("Cache age is too large")
+    return dict(cache)
+
+
+def mount_cache(item):
+    # An absent cache block denotes the original flags, including inherited
+    # rclone size/age/free-space defaults. Never move its implicit cache dir.
+    return item.get("cache") or {"mode": "writes", "maxSize": None, "maxAge": None, "minFreeSpace": None}
+
+
+def mount_args(item):
+    cache = mount_cache(item)
+    args = [tool("rclone"), "mount", item["remote"], item["path"], "--transfers", "8",
+            "--checkers", "16", "--vfs-cache-mode", cache["mode"]]
+    for key, flag in (("maxSize", "--vfs-cache-max-size"), ("maxAge", "--vfs-cache-max-age"),
+                      ("minFreeSpace", "--vfs-cache-min-free-space")):
+        if cache[key] is not None:
+            args.extend([flag, cache[key]])
+    if item.get("cacheDir"):
+        args.extend(["--cache-dir", item["cacheDir"]])
+    return args + ["--rc", "--rc-addr", f"127.0.0.1:{item['port']}"]
+
+
+def logs_dir():
+    path = STATE / "logs"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(STATE, 0o700)
+    os.chmod(path, 0o700)
+    return path
+
+
+def log_path(item_id, kind):
+    if not re.fullmatch(r"[0-9a-f]{32}", item_id):
+        raise UserError("Invalid entry ID for diagnostics")
+    return logs_dir() / f"{kind}-{item_id}-{uuid4().hex}.log"
+
+
+def latest_log(item_id, kind):
+    if not re.fullmatch(r"[0-9a-f]{32}", item_id) or not (STATE / "logs").is_dir():
+        return None
+    matches = sorted((STATE / "logs").glob(f"{kind}-{item_id}-*.log"),
+                     key=lambda path: path.stat().st_mtime, reverse=True)
+    return str(matches[0]) if matches else None
+
+
+def owned_logs():
+    return [path for path in logs_dir().glob("*.log") if re.fullmatch(
+        r"(?:task|mount)-[0-9a-f]{32}-[0-9a-f]{32}\.log", path.name)]
+
+
+def prune_logs(protected=None):
+    # A running writer holds a shared flock. Never remove an active log.
+    with file_lock(STATE / "logs.lock"):
+        paths = sorted(owned_logs(), key=lambda p: p.stat().st_mtime)
+        total = sum(path.stat().st_size for path in paths)
+        for path in paths:
+            if total <= LOG_TOTAL:
+                break
+            if path == protected:
+                continue
+            with path.open("rb") as candidate:
+                try:
+                    fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                size = path.stat().st_size
+                path.unlink()
+                total -= size
+
+
+def stream_logged(args, item_id, kind, on_start=None):
+    path = log_path(item_id, kind)
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "wb+") as output:
+        fcntl.flock(output, fcntl.LOCK_SH)
+        if on_start:
+            on_start(str(path))
+        # One bounded chunk at a time. Never buffer rclone's entire output.
+        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        while True:
+            chunk = process.stdout.read1(65536)
+            if not chunk:
+                break
+            if output.tell() + len(chunk) > LOG_LIMIT:
+                output.seek(-min(output.tell(), LOG_LIMIT // 2), os.SEEK_END)
+                tail = output.read(LOG_LIMIT // 2)
+                output.seek(0)
+                output.truncate()
+                output.write(b"[Earlier output omitted; log size limited]\n" + tail)
+            prune_logs(path)
+            with file_lock(STATE / "logs.lock"):
+                other_bytes = sum(p.stat().st_size for p in owned_logs() if p != path)
+                room = max(0, min(LOG_LIMIT - output.tell(), LOG_TOTAL - other_bytes - output.tell()))
+                output.write(chunk[:room])
+            output.flush()
+        code = process.wait()
+    prune_logs()
+    return code, str(path)
+
+
+def open_logs(item_id=None, kind=None):
+    if item_id:
+        path = latest_log(item_id, kind)
+        if not path:
+            raise UserError("No retained log for this entry")
+    else:
+        path = str(logs_dir())
+    command([tool("gio"), "open", Path(path).as_uri()], timeout=8)
+    return {"message": f"Opened {path}"}
+
+
 def read_state():
     path = STATE / "runs.json"
     if not path.exists():
@@ -80,10 +235,72 @@ def write_json(path, data):
             os.unlink(name)
 
 
+@contextmanager
+def file_lock(path):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def updated_run(task_id, **fields):
-    runs = read_state()
-    runs[task_id] = {**runs.get(task_id, {}), **fields}
-    write_json(STATE / "runs.json", runs)
+    with file_lock(STATE / "runs.lock"):
+        runs = read_state()
+        runs[task_id] = {**runs.get(task_id, {}), **fields}
+        write_json(STATE / "runs.json", runs)
+
+
+def history_entry(run):
+    if run.get("status") not in ("Completed", "Failed", "Stopped", "Interrupted"):
+        return None
+    return {key: run.get(key) for key in ("runId", "status", "startedAt", "finishedAt", "reverse",
+                                          "destination", "total", "exitCode", "failure", "log")}
+
+
+def same_history_run(previous, entry):
+    if entry["runId"]:
+        return previous.get("runId") == entry["runId"]
+    return (previous.get("startedAt"), previous.get("finishedAt"), previous.get("status")) == (
+        entry["startedAt"], entry["finishedAt"], entry["status"])
+
+
+def record_history(run):
+    entry = history_entry(run)
+    history = run.get("history", [])
+    if entry and not any(same_history_run(previous, entry) for previous in history):
+        history = [entry, *history]
+    return history[:TASK_HISTORY_LIMIT]
+
+
+def recently_starting(run):
+    if run.get("status") != "Starting" or not run.get("startedAt"):
+        return False
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(run["startedAt"])).total_seconds()
+        return 0 <= age < 10
+    except (TypeError, ValueError):
+        return False
+
+
+def finish_run(task_id, status, **fields):
+    with file_lock(STATE / "runs.lock"):
+        runs = read_state()
+        run = runs.get(task_id, {})
+        if run.get("status") in ("Completed", "Failed", "Stopped"):
+            return False  # A concurrent stop must not replace a completed result.
+        run = {**run, **fields, "status": status, "finishedAt": datetime.now(timezone.utc).isoformat()}
+        run["history"] = record_history(run)
+        runs[task_id] = run
+        write_json(STATE / "runs.json", runs)
+        return True
+
+
+def available_port(mounts, tasks):
+    used = {item["port"] for item in mounts + tasks if "port" in item}
+    return next(port for port in range(FIRST_TASK_PORT, 65536) if port not in used)
 
 
 def local_path(value):
@@ -95,7 +312,7 @@ def local_path(value):
 
 def remote_path(value):
     value = str(value).strip()
-    if not value or value.startswith(":") or ":" not in value or value.startswith("/"):
+    if not value or value.startswith((":", "/", "-")) or ":" not in value:
         raise UserError("Enter an explicit rclone remote:path")
     return value
 
@@ -133,6 +350,11 @@ def guard_mount(item, new_path=None):
 
 
 def save_mount(payload):
+    with file_lock(CONFIG / "definitions.lock"):
+        return _save_mount(payload)
+
+
+def _save_mount(payload):
     mounts = read_list("mounts")
     label = str(payload.get("label", "")).strip()
     remote = remote_path(payload.get("remote", ""))
@@ -146,28 +368,44 @@ def save_mount(payload):
         raise UserError("That remote or mountpoint is already configured")
     if old:
         guard_mount(old, path)
+        if remote != old["remote"]:
+            raise UserError("Remote changes may strand cached uploads; create a new mount after verifying the old cache")
         entry = {**old, "label": label, "remote": remote, "path": path}
+        if "cache" in payload:
+            entry["cache"] = validate_cache(payload["cache"])
         mounts = [entry if m["id"] == old["id"] else m for m in mounts]
     else:
         used_ports = {m["port"] for m in mounts}
+        used_ports.update(t["port"] for t in read_list("tasks") if "port" in t)
         port = next(p for p in range(5577, 65536) if p not in used_ports)
-        entry = {"id": uuid4().hex, "label": label, "remote": remote, "path": path, "port": port}
+        item_id = uuid4().hex
+        entry = {"id": item_id, "label": label, "remote": remote, "path": path, "port": port,
+                 "cache": validate_cache(payload.get("cache", RECOMMENDED_CACHE)),
+                 "cacheDir": str(CACHE / item_id)}
         mounts.append(entry)
     write_json(CONFIG / "mounts.json", mounts)
     return {"message": "Mount saved"}
 
 
 def delete_mount(item_id):
-    mounts = read_list("mounts")
-    item = next((m for m in mounts if m["id"] == item_id), None)
-    if not item:
-        raise UserError("Mount entry not found")
-    guard_mount(item)
-    write_json(CONFIG / "mounts.json", [m for m in mounts if m["id"] != item_id])
-    return {"message": "Saved entry removed; no remote files were touched"}
+    with file_lock(CONFIG / "definitions.lock"):
+        mounts = read_list("mounts")
+        item = next((m for m in mounts if m["id"] == item_id), None)
+        if not item:
+            raise UserError("Mount entry not found")
+        guard_mount(item)
+        write_json(CONFIG / "mounts.json", [m for m in mounts if m["id"] != item_id])
+        return {"message": "Saved entry removed; cache and remote files were left untouched"}
 
 
 def operate_mount(item_id, action):
+    if action == "open":
+        return _operate_mount(item_id, action)
+    with file_lock(CONFIG / "definitions.lock"):
+        return _operate_mount(item_id, action)
+
+
+def _operate_mount(item_id, action):
     item = next((m for m in read_list("mounts") if m["id"] == item_id), None)
     if not item:
         raise UserError("Mount entry not found")
@@ -177,23 +415,46 @@ def operate_mount(item_id, action):
         path = Path(item["path"])
         if not path.is_dir() or any(path.iterdir()):
             raise UserError("Mountpoint must be an existing empty directory")
+        if item.get("cacheDir"):
+            cache_dir = Path(item["cacheDir"])
+            cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(cache_dir, 0o700)
+        args = mount_args(item)
+        if logging_enabled():
+            args = [sys.executable, str(Path(__file__).resolve()), "mount-worker", item_id]
         command([tool("systemd-run"), "--user", f"--unit={mount_unit(item)[:-8]}", "--collect",
-                 tool("rclone"), "mount", item["remote"], item["path"], "--transfers", "8",
-                 "--checkers", "16", "--vfs-cache-mode", "writes", "--rc",
-                 "--rc-addr", f"127.0.0.1:{item['port']}"])
+                 "--property=UMask=0077", *args])
         return {"message": "Mount starting; check status in a few seconds"}
     if action == "unmount":
         if not mounted(item):
             raise UserError("Mountpoint is not mounted")
+        for check in range(2):
+            status = vfs_status(item["port"])
+            if status["state"] != "clear":
+                raise UserError(f"Unmount blocked: uploads {status['state']}; wait or inspect logs. Cache untouched")
+            if check == 0:
+                time.sleep(1)
+        # fusermount fails on a busy mount (no lazy/force flag). The service is
+        # only stopped after a successful detach; rclone may exit on detach.
         command([tool("fusermount3"), "-u", item["path"]])
+        if mounted(item):
+            raise UserError("Unmount did not complete; mount service left running")
         command([tool("systemctl"), "--user", "stop", mount_unit(item)])
-        return {"message": "Unmounted"}
+        return {"message": "Unmounted; cache retained. New writes during checks cannot be ruled out"}
     if action == "open":
         if not mounted(item):
             raise UserError("Mountpoint is not mounted")
         command([tool("gio"), "open", Path(item["path"]).as_uri()], timeout=8)
         return {"message": "Opening folder"}
     raise UserError("Unknown mount operation")
+
+
+def mount_worker(item_id):
+    item = next((m for m in read_list("mounts") if m["id"] == item_id), None)
+    if not item:
+        raise UserError("Mount definition missing")
+    code, _ = stream_logged(mount_args(item), item_id, "mount")
+    return code
 
 
 def validate_task(payload):
@@ -216,6 +477,11 @@ def validate_task(payload):
 
 
 def save_task(payload):
+    with file_lock(CONFIG / "definitions.lock"):
+        return _save_task(payload)
+
+
+def _save_task(payload):
     tasks = read_list("tasks")
     data = validate_task(payload)
     old = next((t for t in tasks if t["id"] == payload.get("id")), None)
@@ -223,13 +489,21 @@ def save_task(payload):
         raise UserError("Task not found")
     if old and task_unit(old) in active_tasks():
         raise UserError("Stop the task before editing it")
-    item = {"id": old["id"] if old else uuid4().hex, **data}
+    port = old.get("port") if old else None
+    if port is None:
+        port = available_port(read_list("mounts"), tasks)
+    item = {"id": old["id"] if old else uuid4().hex, **data, "port": port}
     tasks = [item if t["id"] == item["id"] else t for t in tasks] if old else tasks + [item]
     write_json(CONFIG / "tasks.json", tasks)
     return {"message": "Task saved"}
 
 
 def delete_task(item_id):
+    with file_lock(CONFIG / "definitions.lock"):
+        return _delete_task(item_id)
+
+
+def _delete_task(item_id):
     tasks = read_list("tasks")
     item = next((t for t in tasks if t["id"] == item_id), None)
     if not item:
@@ -237,48 +511,55 @@ def delete_task(item_id):
     if task_unit(item) in active_tasks():
         raise UserError("Stop the task before removing it")
     write_json(CONFIG / "tasks.json", [t for t in tasks if t["id"] != item_id])
-    runs = read_state()
-    runs.pop(item_id, None)
-    write_json(STATE / "runs.json", runs)
+    with file_lock(STATE / "runs.lock"):
+        runs = read_state()
+        runs.pop(item_id, None)
+        write_json(STATE / "runs.json", runs)
     return {"message": "Saved task removed; no files were touched"}
 
 
-def run_lock():
-    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
-    lock = os.open(STATE / "task.lock", os.O_CREAT | os.O_RDWR, 0o600)
-    os.chmod(STATE / "task.lock", 0o600)
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
-        os.close(lock)
-        raise UserError("A task is already starting or running") from exc
-    return lock
-
-
 def start_task(item_id, reverse=False):
-    item = next((t for t in read_list("tasks") if t["id"] == item_id), None)
+    with file_lock(CONFIG / "definitions.lock"):
+        return _start_task(item_id, reverse)
+
+
+def _start_task(item_id, reverse):
+    tasks = read_list("tasks")
+    item = next((t for t in tasks if t["id"] == item_id), None)
     if not item:
         raise UserError("Task not found")
     if reverse and len(item["destinations"]) != 1:
         raise UserError("Reverse is available for single-destination tasks only")
-    lock = run_lock()
+    if task_unit(item) in active_tasks():
+        raise UserError("This task is already running")
+    if "port" not in item:  # Definitions saved before per-task ports were introduced.
+        item["port"] = available_port(read_list("mounts"), tasks)
+        write_json(CONFIG / "tasks.json", tasks)
+    with file_lock(STATE / "runs.lock"):
+        runs = read_state()
+        previous = runs.get(item_id, {})
+        if recently_starting(previous):
+            raise UserError("This task is already starting; check status in a few seconds")
+        if previous.get("status") in ("Running", "Starting"):
+            previous = {**previous, "status": "Interrupted",
+                        "finishedAt": ""}  # Detection time is not the actual end time.
+        history = record_history(previous)
+        runs[item_id] = {"history": history, "runId": uuid4().hex, "status": "Starting", "reverse": reverse,
+                         "startedAt": datetime.now(timezone.utc).isoformat(), "finishedAt": "",
+                         "destination": 0, "total": len(item["destinations"]),
+                         "log": None, "exitCode": None, "failure": None}
+        write_json(STATE / "runs.json", runs)
     try:
-        if active_tasks():
-            raise UserError("Another Rclone task is running; wait or stop it first")
         command([tool("systemd-run"), "--user", f"--unit={task_unit(item)[:-8]}", "--collect",
                  sys.executable, str(Path(__file__).resolve()), "worker", item_id,
                  "reverse" if reverse else "forward"])
-        updated_run(item_id, status="Starting", reverse=reverse,
-                    startedAt=datetime.now(timezone.utc).isoformat(), destination=0)
-    finally:
-        os.close(lock)
+    except UserError:
+        finish_run(item_id, "Failed", failure="Could not start user service")
+        raise
     return {"message": "Task started as an independent user service"}
 
 
 def worker(item_id, reverse):
-    # Wait briefly for the launch helper to release its lock, then hold it for
-    # the whole sequence. Reloading/disabling Shell cannot affect this process.
-    lock = run_lock_wait()
     try:
         item = next((t for t in read_list("tasks") if t["id"] == item_id), None)
         if not item:
@@ -290,31 +571,26 @@ def worker(item_id, reverse):
         direction = ("download" if item["direction"] == "upload" else "upload") if reverse else item["direction"]
         if direction == "upload" and not Path(source).is_dir():
             raise UserError("Local source folder does not exist")
+        log = None
+        record_log = logging_enabled()
         for index, target in enumerate(targets):
             updated_run(item_id, status="Running", destination=index + 1, total=len(targets))
-            # Do not buffer long-running rclone output in memory or write
-            # potentially private filenames to the Shell extension's logs.
-            result = subprocess.run([tool("rclone"), item["action"], source, target,
-                                     "--transfers", "4", "--checkers", "8", "--stats", "1s",
-                                     "--stats-one-line", "--rc", "--rc-addr", f"127.0.0.1:{TASK_PORT}"],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if result.returncode:
-                updated_run(item_id, status="Failed", finishedAt=datetime.now(timezone.utc).isoformat())
+            args = [tool("rclone"), item["action"], source, target,
+                    "--transfers", "8", "--checkers", "16", "--stats", "1s",
+                    "--stats-one-line", "--rc", "--rc-addr", f"127.0.0.1:{item['port']}"]
+            if record_log:
+                code, log = stream_logged(args, item_id, "task",
+                                          on_start=lambda path: updated_run(item_id, log=path))
+            else:
+                code = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+            if code:
+                finish_run(item_id, "Failed", exitCode=code)
                 return 1
-        updated_run(item_id, status="Completed", finishedAt=datetime.now(timezone.utc).isoformat())
+        finish_run(item_id, "Completed", exitCode=0)
         return 0
-    except UserError:
-        updated_run(item_id, status="Failed", finishedAt=datetime.now(timezone.utc).isoformat())
+    except (UserError, OSError) as exc:
+        finish_run(item_id, "Failed", failure="Local setup failed" if isinstance(exc, OSError) else str(exc))
         return 1
-    finally:
-        os.close(lock)
-
-
-def run_lock_wait():
-    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
-    lock = os.open(STATE / "task.lock", os.O_CREAT | os.O_RDWR, 0o600)
-    fcntl.flock(lock, fcntl.LOCK_EX)
-    return lock
 
 
 def stop_task(item_id):
@@ -322,23 +598,75 @@ def stop_task(item_id):
     if not item or task_unit(item) not in active_tasks():
         raise UserError("Task is not running")
     command([tool("systemctl"), "--user", "stop", task_unit(item)], timeout=30)
-    updated_run(item_id, status="Stopped", finishedAt=datetime.now(timezone.utc).isoformat())
-    return {"message": "Task stopped; incomplete transfers may remain"}
+    stopped = finish_run(item_id, "Stopped")
+    return {"message": "Task stopped; incomplete transfers may remain" if stopped else
+            "Task had already finished; check its latest result"}
+
+
+def rc_call(port, endpoint):
+    try:
+        # RC uses POST; cap the queue response so a very large mount cannot
+        # make each panel refresh buffer an unbounded list of filenames.
+        request = urllib.request.Request(f"http://127.0.0.1:{port}/{endpoint}", data=b"{}",
+                                         headers={"Content-Type": "application/json"})
+        with RC_OPENER.open(request, timeout=3) as response:
+            body = response.read(1024 * 1024 + 1)
+        if len(body) > 1024 * 1024:
+            return None
+        data = json.loads(body)
+        return data if isinstance(data, dict) and "error" not in data else None
+    except (OSError, ValueError):
+        return None
+
+
+def vfs_status(port):
+    # v1.75.0: vfs/stats diskCache.{uploadsQueued,uploadsInProgress,erroredFiles}
+    # and vfs/queue queue[].{uploading,tries}. Neither includes open writes.
+    summary = rc_call(port, "vfs/stats")
+    queue = rc_call(port, "vfs/queue")
+    disk = summary.get("diskCache") if summary else None
+    entries = queue.get("queue") if queue else None
+    if not isinstance(disk, dict) or not isinstance(entries, list) or any(
+            not isinstance(disk.get(key), int) or isinstance(disk[key], bool) or disk[key] < 0
+            for key in ("uploadsQueued", "uploadsInProgress", "erroredFiles")) or any(
+            not isinstance(entry, dict) or not isinstance(entry.get("uploading"), bool) for entry in entries):
+        return {"state": "unknown", "queued": None, "uploading": None, "failed": None, "retried": None}
+    uploading = max(disk["uploadsInProgress"], sum(e["uploading"] for e in entries))
+    queued = max(disk["uploadsQueued"], sum(not e["uploading"] for e in entries))
+    failed = disk["erroredFiles"]
+    retried = sum(isinstance(e.get("tries"), int) and e["tries"] > 1 for e in entries)
+    return {"state": "failed" if failed else "pending" if queued or uploading else "clear",
+            "queued": queued, "uploading": uploading, "failed": failed, "retried": retried}
 
 
 def stats(port):
-    result = command([tool("rclone"), "rc", "--url", f"http://127.0.0.1:{port}", "core/stats"],
-                     timeout=3, check=False)
-    if result.returncode:
+    data = rc_call(port, "core/stats")
+    if not data or not any(key in data for key in ("bytes", "speed", "errors", "transfers")):
         return None
+    return {key: data.get(key) for key in ("bytes", "totalBytes", "speed", "errors",
+                                          "transfers", "totalTransfers", "eta")}
+
+
+def rclone_version():
     try:
-        data = json.loads(result.stdout)
-        return {"bytes": data.get("bytes", 0), "totalBytes": data.get("totalBytes", 0),
-                "speed": data.get("speed", 0), "errors": data.get("errors", 0),
-                "transfers": data.get("transfers", 0), "totalTransfers": data.get("totalTransfers", 0),
-                "eta": data.get("eta")}
-    except ValueError:
-        return None
+        result = command([tool("rclone"), "version"], timeout=4, check=False)
+        return result.stdout.splitlines()[0] if not result.returncode and result.stdout else "Unavailable"
+    except UserError:
+        return "Unavailable"
+
+
+def diagnostics():
+    data = snapshot()
+    mounts = read_list("mounts")
+    for entry, item in zip(data["mounts"], mounts):
+        entry["cache"] = mount_cache(item)
+        entry["cacheDir"] = item.get("cacheDir")  # absent means rclone's original default location
+        entry["transfers"] = 8
+        entry["checkers"] = 16
+    for entry in data["tasks"]:
+        entry["transfers"] = 8
+        entry["checkers"] = 16
+    return {"version": rclone_version(), "logging": logging_enabled(), **data}
 
 
 def snapshot():
@@ -350,21 +678,29 @@ def snapshot():
         is_starting = not is_mounted and active(mount_unit(item))
         mounts.append({"id": item["id"], "label": item["label"], "mounted": is_mounted,
                        "status": "Mounted" if is_mounted else "Starting" if is_starting else "Off",
-                       "stats": stats(item["port"]) if is_mounted else None})
+                       "stats": stats(item["port"]) if is_mounted else None,
+                       "uploads": vfs_status(item["port"]) if is_mounted else None,
+                       "log": latest_log(item["id"], "mount")})
     tasks = []
     for item in read_list("tasks"):
         running = task_unit(item) in units
         run = runs.get(item["id"], {})
         status = run.get("status", "Ready")
         if status in ("Running", "Starting") and not running:
-            status = "Interrupted"  # e.g. killed outside our Stop command
+            # systemd-run can return just before its service appears in list-units.
+            if not recently_starting(run):
+                status = "Interrupted"  # e.g. killed outside our Stop command
+        history = record_history({**run, "status": status}) if status in (
+            "Completed", "Failed", "Stopped", "Interrupted") else run.get("history", [])
         tasks.append({"id": item["id"], "name": item["name"], "action": item["action"],
                       "direction": item["direction"], "destinations": len(item["destinations"]),
                       "running": running, "status": status if running or status != "Starting" else "Starting",
                       "destination": run.get("destination", 0), "total": run.get("total", 0),
-                      "reverse": run.get("reverse", False), "startedAt": run.get("startedAt", ""),
-                      "finishedAt": run.get("finishedAt", ""),
-                      "stats": stats(TASK_PORT) if running and status == "Running" else None})
+                       "reverse": run.get("reverse", False), "startedAt": run.get("startedAt", ""),
+                       "finishedAt": run.get("finishedAt", ""), "exitCode": run.get("exitCode"),
+                        "failure": run.get("failure"), "log": run.get("log") if run.get("log") and Path(run["log"]).is_file() else None,
+                        "history": history,
+                       "stats": stats(item["port"]) if running and status == "Running" and "port" in item else None})
     return {"mounts": mounts, "tasks": tasks, "activeTaskUnits": units}
 
 
@@ -374,10 +710,15 @@ def main(argv):
     operation = argv[1]
     if operation == "worker":
         return worker(argv[2], argv[3] == "reverse")
+    if operation == "mount-worker":
+        return mount_worker(argv[2])
     if operation == "snapshot":
         result = snapshot()
+    elif operation == "diagnostics":
+        result = diagnostics()
     elif operation == "definitions":
-        result = {"mounts": read_list("mounts"), "tasks": read_list("tasks")}
+        result = {"mounts": read_list("mounts"), "tasks": read_list("tasks"),
+                  "logging": logging_enabled()}
     elif operation in ("save-mount", "save-task"):
         data = json.loads(argv[2])
         result = save_mount(data) if operation == "save-mount" else save_task(data)
@@ -391,6 +732,12 @@ def main(argv):
         result = start_task(argv[2], operation == "reverse")
     elif operation == "stop":
         result = stop_task(argv[2])
+    elif operation == "save-diagnostics":
+        result = save_diagnostics(json.loads(argv[2]))
+    elif operation == "open-logs":
+        result = open_logs()
+    elif operation in ("open-task-log", "open-mount-log"):
+        result = open_logs(argv[2], "task" if operation == "open-task-log" else "mount")
     else:
         raise UserError("Unknown command")
     print(json.dumps({"ok": True, **result}))

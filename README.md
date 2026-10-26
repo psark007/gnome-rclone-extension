@@ -1,16 +1,24 @@
 # Rclone Mounts & Tasks for GNOME Shell
 
-Manual Rclone mounts and copy/sync tasks for Fedora GNOME Shell 51. New installs
+Manual Rclone mounts and copy/sync tasks for Fedora GNOME Shell (including 51). New installs
 start empty. Nothing mounts or transfers automatically.
 
 ## Use
 
 - Add mounts and tasks in **Preferences**, using explicit `remote:path` values.
-  Mountpoints must already exist and be empty. Mounts show speed and status;
+  Mountpoints must already exist and be empty. Mounts show transfer activity and upload status;
   active mounts cannot be edited or removed.
-- Tasks run on demand, one at a time. Multiple destinations run sequentially;
+- Tasks run on demand; different tasks can run concurrently, but each task can
+  run only once at a time. Multiple destinations within a task run sequentially;
   a failed destination stops the task. Single-destination tasks can run in
   reverse. Run, Reverse, and Stop require confirmation.
+- The Tasks tab shows the last two outcomes (success, failure, stop, or
+  interruption) with local date/time, duration where known, reverse mode,
+  destination position and exit code where available. The latest five attempts
+  per task are retained privately in `runs.json`; an active run does not erase
+  the previous result. Existing single-run state is shown as one historical
+  result until newer runs replace it. The end time of an unexpected service
+  exit is unknown; the UI labels the recorded start time accordingly.
 - **Sync can delete destination-only files**, including local files when
   downloading or reversing an upload. Check paths before confirming.
 
@@ -19,11 +27,84 @@ to transfer arrows while a task runs. Mounts and Tasks have separate popup
 tabs. Work runs in transient `systemd --user` services, so disabling the
 extension does not stop it: stop tasks and unmount explicitly.
 
+## Mount caching
+
+New mounts default to **Reads and writes** (`--vfs-cache-mode full`), **5G**
+maximum size, **24h** maximum age since last access, and **10G** minimum free
+space target. These are editable safeguards, not a claim that disk space is
+currently low. Choose **Writes only** or **No limit** in each mount's **Caching**
+section. The size limit is soft **per mount**; open files and delayed polling
+can exceed it. Minimum free space is a target, not a reservation. Full mode
+caches only data accessed, not the entire remote; it uses **local disk, not
+RAM**. Cache files for crypt mounts contain **decrypted** data locally. Check
+ space, permissions and backups accordingly. Rclone's directory-cache,
+change-polling, write-back and provider-specific concurrency settings are left
+ at their existing/default values. Mounts and separate copy/sync tasks use
+ 8 transfers / 16 checkers. Caching does not affect tasks.
+
+New mounts have their own cache root under
+`$XDG_CACHE_HOME/gnome-shell-rclone/mounts/<mount-id>/` (or
+`~/.cache/gnome-shell-rclone/mounts/<mount-id>/`). Rclone creates its own VFS
+subdirectories inside that root. **Existing mounts are not moved**: absence
+of a saved `cache` block means Writes only and *inherited rclone defaults* for
+age/size/free-space; absence of `cacheDir` means the original rclone default
+cache root (`rclone config paths` shows its location). Even after
+editing an old mount's cache settings, its cache root remains unchanged. To
+move a legacy mount to a new isolated root manually, first stop new writes,
+wait for uploads, unmount safely, inspect/back up the original cache for
+pending data, then remove the old definition and create a new one. Do **not**
+just move/delete files or change remote names: rclone keys VFS cache content
+by remote/path and pending uploads may be the only copy. Existing definitions
+cannot change their remote through the editor for this reason. Cache files are
+**never** deleted by the extension when removing definitions or disabling it.
+Changes to caching take effect on the **next mount**, not an active mount.
+
+## Diagnostics
+
+**Preferences → Diagnostics** shows installed rclone version, effective
+mount/task transfer and cache settings, upload status and any available
+transfer/error statistics. Missing RC statistics are shown as unavailable,
+not as zero. Opt-in logging (off by default) captures new mount and task runs
+under `$XDG_STATE_HOME/gnome-shell-rclone/logs/` (normally
+`~/.local/state/gnome-shell-rclone/logs/`). The directory is 0700, logs are
+0600, each is limited to 1 MiB and retained logs to 16 MiB total. Older
+output may be omitted to preserve the recent tail. Turn logging on **before**
+reproducing an issue; use **Open logs folder** in Preferences or **Open log**
+on an entry in the panel. Logs are retained after failure and may contain
+filenames, paths and provider errors. **Review before sharing**: they are not
+automatically safe to publish. The extension does not request HTTP dumps,
+headers, auth traces or rclone configuration. With logging off, task failures
+still show an exit code (or a local setup failure). The user service journal
+(`journalctl --user -u 'gnome-rclone-*'`) may help with startup failures.
+
+## Unmount safety
+
+The panel's **Unmount** starts a cancellable wait; **Cancel** leaves the mount
+running. Upload status uses rclone v1.75.0's [`vfs/queue` and `vfs/stats`](https://rclone.org/rc/#vfs-queue).
+The panel distinguishes queued, uploading and failed writes; retry attempts
+are included in the diagnostics state. Once two refreshes report no pending
+uploads, **Unmount now** is available. The backend rechecks twice one second
+apart before `fusermount3 -u`; only after successful detach does it stop the
+user service. A busy FUSE mount is not lazily/forcibly detached. Known pending,
+failed or **unknown** RC upload status blocks unmount; examine logs and retry
+when healthy. No force option or automatic cache deletion is provided.
+
+An empty VFS queue is **not proof of durability**: files still open for writing
+may be absent from the upload queue, new writes can arrive between checks and
+detach, and external unmounts/shutdowns bypass the extension. Stop applications
+writing first, close their files and verify important remote files independently.
+Rclone documents that unuploaded cached files can resume when restarted with
+the same cache settings and remote; preserve the cache after failures. When
+RC is unsupported or unavailable, the extension will not claim safety or
+detach on your behalf. Disabling/reloading Shell leaves services and caches
+alone. The RC interface is loopback-only but powerful (effectively user-level
+access): do not expose its ports to untrusted processes/networks.
+
 Definitions and task history stay outside this repository under
 `~/.config/gnome-shell-rclone/` and `~/.local/state/gnome-shell-rclone/`
 (private permissions). Configure Rclone remotes separately; the extension
-does not discover them. Progress uses loopback-only Rclone RC (task port 5576,
-mount ports from 5577). Do not commit `rclone.conf` or saved definitions.
+does not discover them. Progress uses loopback-only Rclone RC (a distinct port
+per task and mount, allocated from 5576). Do not commit `rclone.conf` or saved definitions.
 
 ## Install on Fedora
 

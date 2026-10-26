@@ -25,6 +25,15 @@ class Actor {
     }
 }
 
+class Button extends Actor {
+    click() {
+        // St.Button updates checked before emitting clicked in toggle mode.
+        if (this.toggle_mode)
+            this.checked = !this.checked;
+        this.signals.clicked?.();
+    }
+}
+
 class BoxLayout extends Actor {
     constructor(properties) {
         assert.ok(!Object.hasOwn(properties, 'vertical'), 'GNOME 51 St.BoxLayout has no vertical property');
@@ -73,7 +82,7 @@ const context = {
     Extension: class {},
     Gio: {}, GLib: {}, GObject: {registerClass: klass => klass},
     Pango: {EllipsizeMode: {END: 3}},
-    St: {BoxLayout, Button: Actor, Icon: Actor, Label},
+    St: {BoxLayout, Button, Icon: Actor, Label},
     PanelMenu: {Button: class {}},
     PopupMenu: {PopupBaseMenuItem: PopupItem, PopupMenuItem: PopupItem,
         PopupSeparatorMenuItem: PopupItem},
@@ -163,4 +172,115 @@ test('panel badge counts mounted entries and all running task units', () => {
     item._updateIndicator();
     assert.equal(item._activity.visible, false);
     assert.equal(item._icon.icon_name, 'folder-remote-symbolic');
+});
+
+test('a running task does not disable controls for another task', () => {
+    const item = indicator();
+    item._tab = 'tasks';
+    item._data.activeTaskUnits = ['gnome-rclone-task-other.service'];
+    item._data.tasks.unshift({id: 'other', name: 'Other task', action: 'copy',
+        status: 'Running', destinations: 1, running: true});
+    item._draw();
+    const taskRow = item.menu.items[2];
+    const buttons = taskRow.children.slice(1);
+    assert.deepEqual(buttons.map(button => button.label), ['Run', 'Reverse']);
+    assert.ok(buttons.every(button => button.reactive && button.signals.clicked));
+    assert.ok(!labels(item).some(label => label.includes('new runs are blocked')));
+});
+
+test('waiting to unmount is cancellable without invoking the backend', () => {
+    const item = indicator();
+    item._data.mounts[0].uploads = {state: 'pending', queued: 2, uploading: 1, failed: 0};
+    let calls = 0;
+    item._refresh = () => {};
+    item._action = () => { calls++; };
+    item._draw();
+    item.menu.items[1].children[2].signals.clicked(); // Unmount arms a wait, not a detach
+    assert.equal(item._waitMount, 'm1');
+    assert.equal(calls, 0);
+    const buttons = item.menu.items[1].children.slice(1);
+    assert.equal(buttons[1].reactive, false);
+    assert.equal(buttons[2].label, 'Cancel');
+    buttons[2].signals.clicked();
+    assert.equal(item._waitMount, null);
+    assert.equal(calls, 0);
+    item._waitForUnmount('m1');
+    item._data.mounts[0].uploads = {state: 'clear', queued: 0, uploading: 0, failed: 0};
+    item._clearSamples = 2;
+    item._draw();
+    item.menu.items[1].children[2].signals.clicked();
+    assert.equal(calls, 1);
+});
+
+test('failed tasks show exit code and retained log action', () => {
+    const item = indicator();
+    item._tab = 'tasks';
+    Object.assign(item._data.tasks[0], {status: 'Failed', exitCode: 7, log: '/private/log'});
+    item._draw();
+    assert.ok(labels(item).some(label => label.includes('exit 7')));
+    assert.equal(item.menu.items[1].children.at(-1).accessible_name, 'Open Example task log');
+});
+
+test('task rows show recent results and dates without widening the menu', () => {
+    const item = indicator();
+    item._tab = 'tasks';
+    item._data.tasks[0].history = [
+        {status: 'Completed', startedAt: '2026-10-02T10:00:00Z',
+            finishedAt: '2026-10-02T10:04:00Z', destination: 2, total: 2, reverse: true},
+        {status: 'Failed', startedAt: '2026-10-01T09:00:00Z',
+            finishedAt: '2026-10-01T09:01:00Z', destination: 1, total: 2, exitCode: 7},
+    ];
+    item._draw();
+    const row = item.menu.items[1];
+    const lines = row.children[0].children.map(label => label.text);
+    assert.equal(lines.length, 4);
+    assert.match(lines[1], /Last: Succeeded/);
+    assert.ok(lines[1].includes(new Date('2026-10-02T10:04:00Z').toLocaleString(undefined,
+        {year: '2-digit', month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit'})));
+    assert.match(lines[2], /4m · reverse · 2\/2 destinations/);
+    assert.match(lines[3], /Before: Failed \(exit 7\)/);
+    assert.equal(item.menu.actor.width, 480);
+    item._data.tasks[0].running = true;
+    item._data.tasks[0].status = 'Running';
+    item._data.tasks[0].destination = 1;
+    item._data.tasks[0].total = 2;
+    item._draw();
+    const runningLines = item.menu.items[1].children[0].children.map(label => label.text);
+    assert.equal(runningLines.length, 4);
+    assert.match(runningLines[1], /destination 1\/2/);
+    assert.match(runningLines[2], /Last: Succeeded/);
+    assert.match(runningLines[3], /Before: Failed/);
+});
+
+test('new tasks show Never run instead of an invented result', () => {
+    const item = indicator();
+    item._tab = 'tasks';
+    item._draw();
+    assert.ok(labels(item).includes('Never run'));
+});
+
+
+test('clicking the active tab keeps it selected and preserves pending actions', () => {
+    const item = indicator();
+    for (const tab of ['mounts', 'tasks']) {
+        item._tab = tab;
+        const pending = {action: 'run', id: 't1'};
+        item._pending = pending;
+        item._message = 'Keep this message';
+        item._draw();
+        const tabs = item.menu.items[0].children;
+        const selected = tabs[tab === 'mounts' ? 0 : 1];
+        for (let count = 0; count < 3; count++) {
+            selected.click();
+            assert.equal(selected.checked, true);
+            assert.equal(item._tab, tab);
+            assert.equal(item._pending, pending);
+            assert.equal(item._message, 'Keep this message');
+            assert.equal(tabs[tab === 'mounts' ? 1 : 0].checked, false);
+        }
+        tabs[tab === 'mounts' ? 1 : 0].click();
+        assert.equal(item._tab, tab === 'mounts' ? 'tasks' : 'mounts');
+        assert.equal(item._pending, null);
+        assert.equal(item.menu.items[0].children[tab === 'mounts' ? 1 : 0].checked, true);
+    }
 });

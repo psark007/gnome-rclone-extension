@@ -19,7 +19,59 @@
 }
 
 .rclone-row-button {
-    padding: 3px 6px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    border: 1px solid rgba(127, 127, 127, 0.24);
+    background-color: rgba(127, 127, 127, 0.12);
+    box-shadow: none;
+    font-weight: 600;
+}
+
+.rclone-row-button:hover {
+    background-color: rgba(127, 127, 127, 0.24);
+}
+
+.rclone-row-button:active {
+    background-color: rgba(127, 127, 127, 0.34);
+}
+
+.rclone-row-button:focus {
+    border-color: -st-accent-color;
+}
+
+.rclone-button-primary {
+    background-color: -st-accent-color;
+    color: -st-accent-fg-color;
+    border-color: transparent;
+}
+
+.rclone-button-primary:hover {
+    background-color: st-lighten(-st-accent-color, 10%);
+}
+
+.rclone-button-primary:active {
+    background-color: st-darken(-st-accent-color, 10%);
+}
+
+.rclone-button-danger {
+    background-color: rgba(224, 27, 36, 0.14);
+    border-color: rgba(224, 27, 36, 0.40);
+}
+
+.rclone-button-danger:hover {
+    background-color: rgba(224, 27, 36, 0.26);
+}
+
+.rclone-button-danger:active {
+    background-color: rgba(224, 27, 36, 0.36);
+}
+
+.rclone-icon-button {
+    padding: 6px;
+}
+
+.rclone-icon-button .popup-menu-icon {
+    icon-size: 16px;
 }
 
 .rclone-tab {
