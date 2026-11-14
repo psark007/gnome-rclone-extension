@@ -106,6 +106,21 @@ Definitions and task history stay outside this repository under
 does not discover them. Progress uses loopback-only Rclone RC (a distinct port
 per task and mount, allocated from 5576). Do not commit `rclone.conf` or saved definitions.
 
+## Transfer definitions between devices
+
+There is no built-in import/export button. Mount and task definitions are stored
+in `~/.config/gnome-shell-rclone/mounts.json` and
+`~/.config/gnome-shell-rclone/tasks.json`. Stop active mounts and tasks, then
+copy those files to the same directory on the other device. Do not copy
+`~/.local/state/gnome-shell-rclone/runs.json` unless task history is wanted.
+
+Before using the copied definitions, update device-specific absolute local paths
+for mountpoints, task sources and destinations, and mount `cacheDir` values.
+Mountpoints must already exist and be empty. Configure the same Rclone remote
+names separately on the destination device; remote credentials are stored in
+Rclone's separate `rclone.conf` and must be transferred or configured securely.
+Review copied definitions before starting any mount or task.
+
 ## Install on Fedora
 
 ```sh
