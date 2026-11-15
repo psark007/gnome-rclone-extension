@@ -8,12 +8,13 @@ export default class RclonePreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         this._window = window;
         this._helper = `${this.path}/backend.py`;
+        this._settings = this.getSettings();
         window.set_default_size(660, 650);
         this._render();
     }
 
     _call(...args) {
-        const process = Gio.Subprocess.new(['/usr/bin/python3', this._helper, ...args],
+        const process = Gio.Subprocess.new(['/usr/bin/python3', this._helper, '--config-dir', this._settings.get_string('config-dir'), ...args],
             Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
         const [, output] = process.communicate_utf8(null, null);
         const data = JSON.parse(output);
@@ -65,14 +66,27 @@ export default class RclonePreferences extends ExtensionPreferences {
             this._window.remove(this._taskPage);
         if (this._diagnosticsPage)
             this._window.remove(this._diagnosticsPage);
+        if (this._settingsPage)
+            this._window.remove(this._settingsPage);
         this._mountEditor = null;
         this._taskEditor = null;
         this._mountPage = new Adw.PreferencesPage({title: 'Mounts', icon_name: 'folder-remote-symbolic'});
         this._taskPage = new Adw.PreferencesPage({title: 'Tasks', icon_name: 'document-send-symbolic'});
         this._diagnosticsPage = new Adw.PreferencesPage({title: 'Diagnostics', icon_name: 'dialog-information-symbolic'});
+        this._settingsPage = new Adw.PreferencesPage({title: 'Settings', icon_name: 'emblem-system-symbolic'});
         this._window.add(this._mountPage);
         this._window.add(this._taskPage);
         this._window.add(this._diagnosticsPage);
+        this._window.add(this._settingsPage);
+        const settingsGroup = new Adw.PreferencesGroup({title: 'Storage', description: 'Choose where mount and task definitions, state, logs, and cache are stored. Point Noctalia at this same directory to share data.'});
+        const configDir = new Adw.EntryRow({title: 'Data directory', text: this._settings.get_string('config-dir')});
+        configDir.connect('notify::text', () => {
+            const value = configDir.text.trim();
+            if (value)
+                this._settings.set_string('config-dir', value);
+        });
+        settingsGroup.add(configDir);
+        this._settingsPage.add(settingsGroup);
         let data;
         try {
             data = this._call('definitions');

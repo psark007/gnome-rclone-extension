@@ -85,6 +85,7 @@ class Indicator extends PanelMenu.Button {
         super._init(0.5, 'Rclone Mounts & Tasks');
         this._extension = extension;
         this._backend = `${extension.path}/backend.py`;
+        this._settings = extension.getSettings();
         this._stopped = false;
         this._refreshing = false;
         this._busy = false;
@@ -116,7 +117,7 @@ class Indicator extends PanelMenu.Button {
             return;
         this._refreshing = true;
         try {
-            const data = await backend(this._backend, 'snapshot');
+            const data = await backend(this._backend, '--config-dir', this._settings.get_string('config-dir'), 'snapshot');
             if (this._stopped)
                 return;
             this._data = data;
@@ -143,13 +144,19 @@ class Indicator extends PanelMenu.Button {
         const mounted = this._data.mounts.filter(mount => mount.mounted).length;
         // Include active task services without a saved definition in the count.
         const running = this._data.activeTaskUnits.length;
-        const parts = [];
-        if (mounted)
-            parts.push(`${mounted}M`);
-        if (running)
-            parts.push(`${running}T`);
-        this._activity.text = parts.join(' · ');
-        this._activity.visible = parts.length > 0;
+        const counts = [];
+        if (mounted > 0)
+            counts.push(`${mounted}M`);
+        if (running > 0)
+            counts.push(`${running}T`);
+        this._activity.text = counts.join(' ');
+        this._activity.visible = running > 0 || mounted > 0;
+        this._activity.remove_style_class_name('rclone-mounted');
+        this._activity.remove_style_class_name('rclone-transfer');
+        if (running > 0)
+            this._activity.add_style_class_name('rclone-transfer');
+        else if (mounted > 0)
+            this._activity.add_style_class_name('rclone-mounted');
         this._icon.icon_name = running
             ? 'network-transmit-receive-symbolic'
             : 'folder-remote-symbolic';
@@ -166,7 +173,7 @@ class Indicator extends PanelMenu.Button {
         this._message = 'Working…';
         this._draw();
         try {
-            const result = await backend(this._backend, action, id);
+            const result = await backend(this._backend, '--config-dir', this._settings.get_string('config-dir'), action, id);
             if (this._stopped)
                 return;
             this._message = result.message || 'Done';

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.rclone-mounts-tasks">
+    <key name="config-dir" type="s">
+      <default>'~/.config/gnome-shell-rclone'</default>
+      <summary>Rclone data directory</summary>
+      <description>Directory containing Rclone mount and task definitions.</description>
+    </key>
+  </schema>
+</schemalist>

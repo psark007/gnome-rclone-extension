@@ -7,6 +7,14 @@
     font-weight: bold;
 }
 
+.rclone-count.rclone-mounted {
+    color: #4da6ff;
+}
+
+.rclone-count.rclone-transfer {
+    color: #52e08a;
+}
+
 .rclone-popup {
     width: 480px;
     min-width: 480px;
@@ -25,6 +33,11 @@
     background-color: rgba(127, 127, 127, 0.12);
     box-shadow: none;
     font-weight: 600;
+}
+
+.rclone-row-button:not(.rclone-icon-button) {
+    min-width: 88px;
+    min-height: 30px;
 }
 
 .rclone-row-button:hover {

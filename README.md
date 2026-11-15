@@ -12,6 +12,11 @@ start empty. Nothing mounts or transfers automatically.
   run only once at a time. Multiple destinations within a task run sequentially;
   a failed destination stops the task. Single-destination tasks can run in
   reverse. Run, Reverse, and Stop require confirmation.
+- Set **Preferences → Settings → Data directory** to choose where definitions,
+  state, logs, and cache live. The GNOME default remains
+  `~/.config/gnome-shell-rclone` for existing installations.
+- To share definitions with the Noctalia widget, set Noctalia's **Data
+  directory** to the same path in **Settings → Plugins → Rclone Status**.
 - The Tasks tab shows the last two outcomes (success, failure, stop, or
   interruption) with local date/time, duration where known, reverse mode,
   destination position and exit code where available. The latest five attempts
@@ -22,9 +27,9 @@ start empty. Nothing mounts or transfers automatically.
 - **Sync can delete destination-only files**, including local files when
   downloading or reversing an upload. Check paths before confirming.
 
-The panel shows mounted (`M`) and running-task (`T`) counts; its icon switches
-to transfer arrows while a task runs. Mounts and Tasks have separate popup
-tabs. Work runs in transient `systemd --user` services, so disabling the
+The panel indicator shows counts such as `2M 1T`; zero values are omitted and
+its icon switches to transfer arrows while a task runs. Mounts and Tasks have
+separate popup tabs. Work runs in transient `systemd --user` services, so disabling the
 extension does not stop it: stop tasks and unmount explicitly.
 
 ## Mount caching
@@ -43,8 +48,7 @@ change-polling, write-back and provider-specific concurrency settings are left
  8 transfers / 16 checkers. Caching does not affect tasks.
 
 New mounts have their own cache root under
-`$XDG_CACHE_HOME/gnome-shell-rclone/mounts/<mount-id>/` (or
-`~/.cache/gnome-shell-rclone/mounts/<mount-id>/`). Rclone creates its own VFS
+the selected data directory's `.cache/mounts/<mount-id>/`. Rclone creates its own VFS
 subdirectories inside that root. **Existing mounts are not moved**: absence
 of a saved `cache` block means Writes only and *inherited rclone defaults* for
 age/size/free-space; absence of `cacheDir` means the original rclone default
@@ -65,8 +69,7 @@ Changes to caching take effect on the **next mount**, not an active mount.
 mount/task transfer and cache settings, upload status and any available
 transfer/error statistics. Missing RC statistics are shown as unavailable,
 not as zero. Opt-in logging (off by default) captures new mount and task runs
-under `$XDG_STATE_HOME/gnome-shell-rclone/logs/` (normally
-`~/.local/state/gnome-shell-rclone/logs/`). The directory is 0700, logs are
+under the selected data directory's `.state/logs/`. The directory is 0700, logs are
 0600, each is limited to 1 MiB and retained logs to 16 MiB total. Older
 output may be omitted to preserve the recent tail. Turn logging on **before**
 reproducing an issue; use **Open logs folder** in Preferences or **Open log**
@@ -100,19 +103,17 @@ detach on your behalf. Disabling/reloading Shell leaves services and caches
 alone. The RC interface is loopback-only but powerful (effectively user-level
 access): do not expose its ports to untrusted processes/networks.
 
-Definitions and task history stay outside this repository under
-`~/.config/gnome-shell-rclone/` and `~/.local/state/gnome-shell-rclone/`
-(private permissions). Configure Rclone remotes separately; the extension
+Definitions and task history stay outside this repository under the selected
+data directory (private permissions). Configure Rclone remotes separately; the extension
 does not discover them. Progress uses loopback-only Rclone RC (a distinct port
 per task and mount, allocated from 5576). Do not commit `rclone.conf` or saved definitions.
 
 ## Transfer definitions between devices
 
 There is no built-in import/export button. Mount and task definitions are stored
-in `~/.config/gnome-shell-rclone/mounts.json` and
-`~/.config/gnome-shell-rclone/tasks.json`. Stop active mounts and tasks, then
-copy those files to the same directory on the other device. Do not copy
-`~/.local/state/gnome-shell-rclone/runs.json` unless task history is wanted.
+in the selected data directory as `mounts.json` and `tasks.json`. Stop active
+mounts and tasks, then copy those files to the same directory on the other
+device. Do not copy the `.state` directory unless task history is wanted.
 
 Before using the copied definitions, update device-specific absolute local paths
 for mountpoints, task sources and destinations, and mount `cacheDir` values.

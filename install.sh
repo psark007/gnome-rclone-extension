@@ -12,6 +12,9 @@ install -d -m 0755 "$target"
 for name in backend.py extension.js metadata.json prefs.js stylesheet.css; do
     install -m 0644 "$source_dir/$name" "$target/$name"
 done
+install -d -m 0755 "$target/schemas"
+install -m 0644 "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/schemas/org.gnome.shell.extensions.rclone-mounts-tasks.gschema.xml" "$target/schemas/"
+glib-compile-schemas "$target/schemas"
 echo "Installed extension code at $target"
 echo 'Enable it in the Extensions app or run: gnome-extensions enable rclone-mounts-tasks@psark007.github.io'
 echo 'No mount or transfer was started.'

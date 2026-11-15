@@ -27,6 +27,17 @@ LOG_TOTAL = 16 * 1024 * 1024
 RC_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
+def configure_storage(config_dir):
+    global CONFIG, STATE, CACHE
+    CONFIG = Path(config_dir).expanduser()
+    STATE = CONFIG / ".state"
+    CACHE = CONFIG / ".cache" / "mounts"
+
+
+def backend_command(operation, *args):
+    return [sys.executable, str(Path(__file__).resolve()), "--config-dir", str(CONFIG), operation, *args]
+
+
 class UserError(Exception):
     pass
 
@@ -421,7 +432,7 @@ def _operate_mount(item_id, action):
             os.chmod(cache_dir, 0o700)
         args = mount_args(item)
         if logging_enabled():
-            args = [sys.executable, str(Path(__file__).resolve()), "mount-worker", item_id]
+            args = backend_command("mount-worker", item_id)
         command([tool("systemd-run"), "--user", f"--unit={mount_unit(item)[:-8]}", "--collect",
                  "--property=UMask=0077", *args])
         return {"message": "Mount starting; check status in a few seconds"}
@@ -551,8 +562,7 @@ def _start_task(item_id, reverse):
         write_json(STATE / "runs.json", runs)
     try:
         command([tool("systemd-run"), "--user", f"--unit={task_unit(item)[:-8]}", "--collect",
-                 sys.executable, str(Path(__file__).resolve()), "worker", item_id,
-                 "reverse" if reverse else "forward"])
+                 *backend_command("worker", item_id, "reverse" if reverse else "forward")])
     except UserError:
         finish_run(item_id, "Failed", failure="Could not start user service")
         raise
@@ -707,6 +717,15 @@ def snapshot():
 def main(argv):
     if len(argv) < 2:
         raise UserError("Missing command")
+    args = list(argv[1:])
+    if args[:1] == ["--config-dir"]:
+        if len(args) < 3:
+            raise UserError("Missing config directory")
+        configure_storage(args[1])
+        args = args[2:]
+    if not args:
+        raise UserError("Missing command")
+    argv = [argv[0], *args]
     operation = argv[1]
     if operation == "worker":
         return worker(argv[2], argv[3] == "reverse")
