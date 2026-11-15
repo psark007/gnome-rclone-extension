@@ -10,7 +10,7 @@ import urllib.error
 from unittest import mock
 
 
-SOURCE = Path(__file__).resolve().parents[1] / "rclone-mounts-tasks@psark007.github.io/backend.py"
+SOURCE = Path(__file__).resolve().parents[1] / "rclone-manager@psark007.github.io/backend.py"
 spec = importlib.util.spec_from_file_location("rclone_backend", SOURCE)
 backend = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(backend)

@@ -27,8 +27,9 @@
 }
 
 .rclone-row-button {
-    padding: 6px 10px;
-    border-radius: 8px;
+    padding: 1px 6px;
+    min-height: 0;
+    border-radius: 6px;
     border: 1px solid rgba(127, 127, 127, 0.24);
     background-color: rgba(127, 127, 127, 0.12);
     box-shadow: none;
@@ -36,8 +37,8 @@
 }
 
 .rclone-row-button:not(.rclone-icon-button) {
-    min-width: 88px;
-    min-height: 30px;
+    min-width: 68px;
+    min-height: 22px;
 }
 
 .rclone-row-button:hover {
@@ -80,7 +81,7 @@
 }
 
 .rclone-icon-button {
-    padding: 6px;
+    padding: 3px;
 }
 
 .rclone-icon-button .popup-menu-icon {

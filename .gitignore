@@ -4,5 +4,6 @@ __pycache__/
 *.zip
 mounts.json
 tasks.json
+bisyncs.json
 runs.json
 rclone.conf

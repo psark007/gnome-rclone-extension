@@ -72,6 +72,8 @@ function recentRun(entry, prefix) {
     }
     if (entry.reverse)
         info.push('reverse');
+    if (entry.resyncMode)
+        info.push(`resync · ${entry.resyncMode}`);
     if (entry.total)
         info.push(entry.destination
             ? `${entry.status === 'Completed' ? '' : 'at '}${entry.destination}/${entry.total} destinations`
@@ -82,7 +84,7 @@ function recentRun(entry, prefix) {
 const Indicator = GObject.registerClass(
 class Indicator extends PanelMenu.Button {
     _init(extension) {
-        super._init(0.5, 'Rclone Mounts & Tasks');
+        super._init(0.5, 'Rclone Manager');
         this._extension = extension;
         this._backend = `${extension.path}/backend.py`;
         this._settings = extension.getSettings();
@@ -93,7 +95,7 @@ class Indicator extends PanelMenu.Button {
         this._waitMount = null;
         this._clearSamples = 0;
         this._tab = 'mounts';
-        this._data = {mounts: [], tasks: [], activeTaskUnits: []};
+        this._data = {mounts: [], tasks: [], bisyncs: [], activeTaskUnits: []};
         this._message = '';
         this._panelBox = new St.BoxLayout({orientation: Clutter.Orientation.HORIZONTAL,
             y_align: Clutter.ActorAlign.CENTER, style_class: 'rclone-indicator'});
@@ -160,7 +162,7 @@ class Indicator extends PanelMenu.Button {
         this._icon.icon_name = running
             ? 'network-transmit-receive-symbolic'
             : 'folder-remote-symbolic';
-        this.accessible_name = `Rclone: ${mounted} mounted, ${running} transfers running`;
+        this.accessible_name = `Rclone Manager: ${mounted} mounted, ${running} transfers running`;
     }
 
     async _action(action, id) {
@@ -215,12 +217,19 @@ class Indicator extends PanelMenu.Button {
         row.add_child(text);
         for (const control of controls) {
             const button = new St.Button({
-                style_class: `button rclone-row-button${control.icon ? ' rclone-icon-button' : ''}${control.kind ? ` rclone-button-${control.kind}` : ''}`,
+                style_class: `rclone-row-button${control.icon ? ' rclone-icon-button' : ''}${control.kind ? ` rclone-button-${control.kind}` : ''}`,
                 ...(control.icon ? {} : {label: control.label}),
                 reactive: control.enabled !== false && !this._busy,
                 can_focus: control.enabled !== false && !this._busy,
                 accessible_name: control.name || control.label,
+                // PopupBaseMenuItem's horizontal layout otherwise allocates the
+                // full row height to every child, stretching buttons beside
+                // multi-line bisync details.
+                y_expand: false,
+                y_align: Clutter.ActorAlign.CENTER,
             });
+            button.set_height(22);
+            button.set_style('min-height: 22px; padding-top: 0px; padding-bottom: 0px;');
             if (control.icon)
                 button.set_child(new St.Icon({icon_name: control.icon, style_class: 'popup-menu-icon'}));
             if (control.enabled !== false && !this._busy)
@@ -232,13 +241,14 @@ class Indicator extends PanelMenu.Button {
         this.menu.addMenuItem(row);
     }
 
-    _tabs(mounts, tasks) {
+    _tabs(mounts, tasks, bisyncs) {
         const row = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
         const mounted = mounts.filter(mount => mount.mounted).length;
-        const running = tasks.filter(task => task.running).length;
+        const totalTasks = tasks.length + bisyncs.length;
+        const running = tasks.filter(task => task.running).length + bisyncs.filter(item => item.running).length;
         for (const [tab, label] of [
             ['mounts', `Mounts · ${mounted}/${mounts.length}`],
-            ['tasks', `Tasks · ${tasks.length}${running ? ` (${running} running)` : ''}`],
+            ['tasks', `Tasks · ${totalTasks}${running ? ` (${running} running)` : ''}`],
         ]) {
             const button = new St.Button({
                 label,
@@ -285,8 +295,8 @@ class Indicator extends PanelMenu.Button {
             return;
         this.menu.removeAll();
         this.menu.actor.set_width(MENU_WIDTH);
-        const {mounts, tasks} = this._data;
-        this._tabs(mounts, tasks);
+        const {mounts, tasks, bisyncs = []} = this._data;
+        this._tabs(mounts, tasks, bisyncs);
         if (this._tab === 'mounts') {
             if (!mounts.length)
                 this._item('No entries · add one in Preferences', null, false);
@@ -331,11 +341,18 @@ class Indicator extends PanelMenu.Button {
                 this._row(mount.label, details, controls);
             }
         } else {
-            if (!tasks.length)
+            if (!tasks.length && !bisyncs.length)
                 this._item('No tasks · add one in Preferences', null, false);
             for (const task of tasks) {
                 const controls = [];
                 const details = [];
+                details.push(task.direction === 'upload' ? 'Upload' : 'Download');
+                if (task.schedule) {
+                    const when = task.schedule.frequency === 'daily'
+                        ? `Daily at ${task.schedule.time}`
+                        : `${task.schedule.weekday[0].toUpperCase()}${task.schedule.weekday.slice(1)} at ${task.schedule.time}`;
+                    details.push(`Scheduled · ${when} local time`);
+                }
                 const history = task.history || [];
                 if (task.running) {
                     const index = task.destination ? ` ${task.destination}/${task.total}` : '';
@@ -352,17 +369,25 @@ class Indicator extends PanelMenu.Button {
                 } else {
                     const running = this._pending?.action === 'run' && this._pending.id === task.id;
                     const reversed = this._pending?.action === 'reverse' && this._pending.id === task.id;
-                    if (running || reversed)
-                        details.push(task.action === 'sync'
-                            ? 'Sync can delete destination-only files. Confirm to proceed.'
-                            : reversed ? 'Reverse swaps source and destination for this run.'
+                    if (running || reversed) {
+                        if (task.action === 'sync')
+                            details.push(reversed
+                                ? 'Reverse Sync swaps source and destination; it can delete files at the new destination. Confirm to proceed.'
+                                : 'Sync can delete destination-only files. Confirm to proceed.');
+                        else
+                            details.push(reversed ? 'Reverse swaps source and destination for this run.'
                                 : 'Confirm this manual copy.');
+                    }
                     controls.push({label: running ? `Confirm ${task.action.toUpperCase()}` : 'Run', kind: 'primary',
                         activate: () => this._confirm('run', task.id)});
-                    if (task.destinations === 1) {
-                        controls.push({label: reversed ? 'Confirm Reverse' : 'Reverse',
+                    controls.push(reversed
+                        ? {label: task.action === 'sync' ? 'Confirm Reverse Sync' : 'Confirm Reverse',
+                            kind: task.action === 'sync' ? 'danger' : undefined,
+                            activate: () => this._confirm('reverse', task.id)}
+                        : {label: 'Reverse', enabled: task.destinations === 1,
+                            name: task.destinations === 1 ? 'Reverse source and destination'
+                                : 'Reverse requires a single destination',
                             activate: () => this._confirm('reverse', task.id)});
-                    }
                 }
                 if (!task.running && task.status === 'Failed' && !history.length)
                     details.push(task.exitCode !== null && task.exitCode !== undefined
@@ -382,6 +407,66 @@ class Indicator extends PanelMenu.Button {
                     controls.push({icon: 'text-x-generic-symbolic', name: `Open ${task.name} log`,
                         activate: () => this._action('open-task-log', task.id)});
                 this._row(`${task.name} · ${task.action.toUpperCase()} · ${task.status}`, details, controls);
+            }
+            if (bisyncs.length) {
+                this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+                this._item('Bisync pairs', null, false);
+            }
+            for (const item of bisyncs) {
+                const controls = [];
+                const details = [`Path 1: ${item.path1}`, `Path 2: ${item.path2}`];
+                if (item.schedule) {
+                    const when = item.schedule.frequency === 'daily'
+                        ? `Daily at ${item.schedule.time}`
+                        : `${item.schedule.weekday[0].toUpperCase()}${item.schedule.weekday.slice(1)} at ${item.schedule.time}`;
+                    details.push(`Scheduled · ${when} local time`);
+                }
+                const history = item.history || [];
+                if (item.running) {
+                    const progress = item.stats
+                        ? `${bytes(item.stats.bytes)} / ${bytes(item.stats.totalBytes)} · ${bytes(item.stats.speed)}/s · ${item.stats.errors ?? '?'} errors`
+                        : 'Progress unavailable';
+                    details.push(item.status === 'Starting' ? 'Starting Bisync…' : `Running · ${progress}`);
+                    const stopping = this._pending?.action === 'stop-bisync' && this._pending.id === item.id;
+                    if (stopping)
+                        details.push('Confirm stopping; Bisync will receive a graceful interrupt.');
+                    controls.push({label: stopping ? 'Confirm Stop' : 'Stop', kind: 'danger',
+                        activate: () => this._confirm('stop-bisync', item.id)});
+                } else {
+                    const running = this._pending?.action === 'run-bisync' && this._pending.id === item.id;
+                    const resync = this._pending?.action === 'resync-bisync' && this._pending.id === item.id;
+                    if (running)
+                        details.push('Bisync needs a saved baseline and propagates changes and deletions both ways. Use Resync for first setup. Confirm to proceed.');
+                    if (resync)
+                        details.push(`Resync resets the baseline and may restore deleted files; ${item.resyncMode} is preferred for conflicts. Review both folders before confirming.`);
+                    controls.push({label: running ? 'Confirm Run' : 'Run', kind: 'primary',
+                        activate: () => this._confirm('run-bisync', item.id)});
+                    controls.push({label: resync ? 'Confirm Resync' : 'Resync',
+                        kind: resync ? 'danger' : undefined,
+                        activate: () => this._confirm('resync-bisync', item.id)});
+                }
+                if (!item.running && item.status === 'Failed') {
+                    if (item.exitCode === 7) {
+                        details.push('Bisync aborted critically; inspect its log and review both folders before resyncing.');
+                    } else if (!history.length) {
+                        details.push(item.exitCode !== null && item.exitCode !== undefined
+                            ? `Bisync failed (exit ${item.exitCode})${item.log ? ' · Log available' : ''}`
+                            : `Bisync failed: ${item.failure || 'see service journal'}${item.log ? ' · Log available' : ''}`);
+                    }
+                }
+                if (history.length) {
+                    details.push(recentRun(history[0], 'Last').summary);
+                    if (recentRun(history[0], 'Last').info)
+                        details.push(recentRun(history[0], 'Last').info);
+                    if (history.length > 1)
+                        details.push(recentRun(history[1], 'Before').summary);
+                } else if (!item.running && item.status === 'Ready') {
+                    details.push(`Resync preference: ${item.resyncMode}`);
+                }
+                if (item.log)
+                    controls.push({icon: 'text-x-generic-symbolic', name: `Open ${item.name} log`,
+                        activate: () => this._action('open-bisync-log', item.id)});
+                this._row(`${item.name} · BISYNC · ${item.status}`, details, controls);
             }
         }
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());

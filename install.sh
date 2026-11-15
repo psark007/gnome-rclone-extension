@@ -6,15 +6,19 @@ if (( EUID == 0 )); then
     exit 1
 fi
 
-source_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/rclone-mounts-tasks@psark007.github.io"
-target="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/rclone-mounts-tasks@psark007.github.io"
+project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source_dir="$project_dir/rclone-manager@psark007.github.io"
+extensions_dir="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions"
+target="$extensions_dir/rclone-manager@psark007.github.io"
 install -d -m 0755 "$target"
 for name in backend.py extension.js metadata.json prefs.js stylesheet.css; do
     install -m 0644 "$source_dir/$name" "$target/$name"
 done
 install -d -m 0755 "$target/schemas"
-install -m 0644 "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/schemas/org.gnome.shell.extensions.rclone-mounts-tasks.gschema.xml" "$target/schemas/"
+for schema in "$project_dir"/schemas/*.gschema.xml; do
+    install -m 0644 "$schema" "$target/schemas/"
+done
 glib-compile-schemas "$target/schemas"
 echo "Installed extension code at $target"
-echo 'Enable it in the Extensions app or run: gnome-extensions enable rclone-mounts-tasks@psark007.github.io'
+echo 'Enable it in the Extensions app or run: gnome-extensions enable rclone-manager@psark007.github.io'
 echo 'No mount or transfer was started.'

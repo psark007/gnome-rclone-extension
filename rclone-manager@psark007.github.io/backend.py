@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manual rclone controls. No remote discovery, imports, or scheduled work."""
+"""Rclone Manager controls for GNOME Shell."""
 
 import fcntl
 import json
@@ -13,7 +13,7 @@ import time
 import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "gnome-shell-rclone"
@@ -154,7 +154,7 @@ def latest_log(item_id, kind):
 
 def owned_logs():
     return [path for path in logs_dir().glob("*.log") if re.fullmatch(
-        r"(?:task|mount)-[0-9a-f]{32}-[0-9a-f]{32}\.log", path.name)]
+        r"(?:task|mount|bisync)-[0-9a-f]{32}-[0-9a-f]{32}\.log", path.name)]
 
 
 def prune_logs(protected=None):
@@ -268,7 +268,7 @@ def history_entry(run):
     if run.get("status") not in ("Completed", "Failed", "Stopped", "Interrupted"):
         return None
     return {key: run.get(key) for key in ("runId", "status", "startedAt", "finishedAt", "reverse",
-                                          "destination", "total", "exitCode", "failure", "log")}
+                                          "destination", "total", "exitCode", "failure", "log", "resyncMode")}
 
 
 def same_history_run(previous, entry):
@@ -309,8 +309,8 @@ def finish_run(task_id, status, **fields):
         return True
 
 
-def available_port(mounts, tasks):
-    used = {item["port"] for item in mounts + tasks if "port" in item}
+def available_port(mounts, tasks, bisyncs=None):
+    used = {item["port"] for item in mounts + tasks + (bisyncs or []) if "port" in item}
     return next(port for port in range(FIRST_TASK_PORT, 65536) if port not in used)
 
 
@@ -336,6 +336,94 @@ def task_unit(item):
     return f"gnome-rclone-task-{item['id']}.service"
 
 
+def bisync_unit(item):
+    return f"gnome-rclone-bisync-{item['id']}.service"
+
+
+def schedule_unit(item, kind="task"):
+    prefix = "gnome-rclone-schedule" if kind == "task" else "gnome-rclone-bisync-schedule"
+    return f"{prefix}-{item['id']}"
+
+
+def systemd_quote(value):
+    """Quote one systemd ExecStart argument, including specifier/variable markers."""
+    value = str(value).replace("%", "%%").replace("$", "$$")
+    value = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{value}"'
+
+
+def schedule_files(item, kind="task"):
+    schedule = item.get("schedule")
+    if not schedule:
+        return None
+    name = schedule_unit(item, kind)
+    user_units = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
+    service = user_units / f"{name}.service"
+    timer = user_units / f"{name}.timer"
+    calendar = f"*-*-* {schedule['time']}:00" if schedule["frequency"] == "daily" else \
+        f"{schedule['weekday'].capitalize()} *-*-* {schedule['time']}:00"
+    operation = "scheduled-bisync-run" if kind == "bisync" else "scheduled-run"
+    label = "Bisync" if kind == "bisync" else "task"
+    executable = " ".join(systemd_quote(arg) for arg in (
+        sys.executable, str(Path(__file__).resolve()), "--config-dir", str(CONFIG), operation, item["id"]))
+    service_text = (f"[Unit]\nDescription=Scheduled Rclone {label}\n\n[Service]\n"
+                    f"Type=oneshot\nExecStart={executable}\n")
+    timer_text = (f"[Unit]\nDescription=Schedule for Rclone {label}\n\n[Timer]\n"
+                  f"OnCalendar={calendar}\nPersistent=true\nUnit={name}.service\n\n"
+                  "[Install]\nWantedBy=timers.target\n")
+    return user_units, service, timer, service_text, timer_text
+
+
+def sync_schedule(item, kind="task"):
+    files = schedule_files(item, kind)
+    name = schedule_unit(item, kind)
+    user_units = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
+    service = user_units / f"{name}.service"
+    timer = user_units / f"{name}.timer"
+    if files:
+        user_units, service, timer, service_text, timer_text = files
+        user_units.mkdir(mode=0o700, parents=True, exist_ok=True)
+        atomic_write_text(service, service_text, 0o600)
+        atomic_write_text(timer, timer_text, 0o600)
+        command([tool("systemctl"), "--user", "daemon-reload"])
+        command([tool("systemctl"), "--user", "enable", "--now", timer.name])
+        command([tool("systemctl"), "--user", "restart", timer.name])
+    else:
+        if not service.exists() and not timer.exists():
+            return
+        command([tool("systemctl"), "--user", "disable", "--now", timer.name], check=False)
+        removed = False
+        for path in (timer, service):
+            if path.exists():
+                path.unlink()
+                removed = True
+        if removed:
+            command([tool("systemctl"), "--user", "daemon-reload"])
+
+
+def sync_task_schedule(item):
+    sync_schedule(item, "task")
+
+
+def sync_bisync_schedule(item):
+    sync_schedule(item, "bisync")
+
+
+def atomic_write_text(path, value, mode=0o600):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as output:
+            output.write(value)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(name, mode)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
 def mounted(item):
     return command([tool("mountpoint"), "-q", item["path"]], check=False, timeout=4).returncode == 0
 
@@ -347,9 +435,9 @@ def active(unit):
 def active_tasks():
     result = command([tool("systemctl"), "--user", "list-units", "--no-legend", "--plain",
                       "--type=service", "--state=active,activating", "gnome-rclone-task-*.service",
-                      "rclone-task-*.service"], timeout=5)
+                      "gnome-rclone-bisync-*.service", "rclone-task-*.service"], timeout=5)
     return [line.split()[0] for line in result.stdout.splitlines()
-            if line.startswith(("gnome-rclone-task-", "rclone-task-"))]
+            if line.startswith(("gnome-rclone-task-", "gnome-rclone-bisync-", "rclone-task-"))]
 
 
 def guard_mount(item, new_path=None):
@@ -387,7 +475,7 @@ def _save_mount(payload):
         mounts = [entry if m["id"] == old["id"] else m for m in mounts]
     else:
         used_ports = {m["port"] for m in mounts}
-        used_ports.update(t["port"] for t in read_list("tasks") if "port" in t)
+        used_ports.update(t["port"] for t in read_list("tasks") + read_list("bisyncs") if "port" in t)
         port = next(p for p in range(5577, 65536) if p not in used_ports)
         item_id = uuid4().hex
         entry = {"id": item_id, "label": label, "remote": remote, "path": path, "port": port,
@@ -483,8 +571,24 @@ def validate_task(payload):
     destinations = [target(d) for d in destinations]
     if len(set(destinations)) != len(destinations):
         raise UserError("Duplicate destinations are not allowed")
+    schedule = payload.get("schedule")
+    if schedule is not None:
+        if not isinstance(schedule, dict):
+            raise UserError("Invalid task schedule")
+        frequency = schedule.get("frequency")
+        time_of_day = schedule.get("time")
+        weekday = schedule.get("weekday", "monday")
+        if frequency not in ("daily", "weekly") or not isinstance(time_of_day, str) or not re.fullmatch(
+                r"(?:[01]\d|2[0-3]):[0-5]\d", time_of_day):
+            raise UserError("Choose a valid daily or weekly schedule time")
+        if frequency == "weekly" and weekday not in (
+                "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"):
+            raise UserError("Choose a valid weekday for the weekly schedule")
+        schedule = {"frequency": frequency, "time": time_of_day}
+        if frequency == "weekly":
+            schedule["weekday"] = weekday
     return {"name": name, "source": source, "destinations": destinations,
-            "direction": direction, "action": action}
+            "direction": direction, "action": action, "schedule": schedule}
 
 
 def save_task(payload):
@@ -502,10 +606,19 @@ def _save_task(payload):
         raise UserError("Stop the task before editing it")
     port = old.get("port") if old else None
     if port is None:
-        port = available_port(read_list("mounts"), tasks)
+        port = available_port(read_list("mounts"), tasks, read_list("bisyncs"))
     item = {"id": old["id"] if old else uuid4().hex, **data, "port": port}
-    tasks = [item if t["id"] == item["id"] else t for t in tasks] if old else tasks + [item]
-    write_json(CONFIG / "tasks.json", tasks)
+    updated = [item if t["id"] == item["id"] else t for t in tasks] if old else tasks + [item]
+    write_json(CONFIG / "tasks.json", updated)
+    try:
+        sync_task_schedule(item)
+    except UserError:
+        write_json(CONFIG / "tasks.json", tasks)
+        try:
+            sync_task_schedule(old or {"id": item["id"], "schedule": None})
+        except UserError:
+            pass
+        raise
     return {"message": "Task saved"}
 
 
@@ -521,6 +634,7 @@ def _delete_task(item_id):
         raise UserError("Task not found")
     if task_unit(item) in active_tasks():
         raise UserError("Stop the task before removing it")
+    sync_task_schedule({**item, "schedule": None})
     write_json(CONFIG / "tasks.json", [t for t in tasks if t["id"] != item_id])
     with file_lock(STATE / "runs.lock"):
         runs = read_state()
@@ -544,7 +658,7 @@ def _start_task(item_id, reverse):
     if task_unit(item) in active_tasks():
         raise UserError("This task is already running")
     if "port" not in item:  # Definitions saved before per-task ports were introduced.
-        item["port"] = available_port(read_list("mounts"), tasks)
+        item["port"] = available_port(read_list("mounts"), tasks, read_list("bisyncs"))
         write_json(CONFIG / "tasks.json", tasks)
     with file_lock(STATE / "runs.lock"):
         runs = read_state()
@@ -611,6 +725,195 @@ def stop_task(item_id):
     stopped = finish_run(item_id, "Stopped")
     return {"message": "Task stopped; incomplete transfers may remain" if stopped else
             "Task had already finished; check its latest result"}
+
+
+def bisync_path(value):
+    value = str(value).strip()
+    if value.startswith(("/", "~/")):
+        return local_path(value)
+    value = remote_path(value)
+    if ".." in PurePosixPath(value.split(":", 1)[1]).parts:
+        raise UserError("Bisync remote paths cannot contain '..'")
+    return value
+
+
+def bisync_roots_overlap(left, right):
+    left_remote = not left.startswith(("/", "~/"))
+    right_remote = not right.startswith(("/", "~/"))
+    if left_remote != right_remote:
+        return False
+    if left_remote:
+        left_name, left_path = left.split(":", 1)
+        right_name, right_path = right.split(":", 1)
+        if left_name != right_name:
+            return False
+        left_parts = PurePosixPath("/" + left_path.lstrip("/")).parts
+        right_parts = PurePosixPath("/" + right_path.lstrip("/")).parts
+        return left_parts == right_parts[:len(left_parts)] or right_parts == left_parts[:len(right_parts)]
+    left_path = Path(left).expanduser().resolve(strict=False)
+    right_path = Path(right).expanduser().resolve(strict=False)
+    return left_path == right_path or left_path in right_path.parents or right_path in left_path.parents
+
+
+def validate_bisync(payload):
+    name = str(payload.get("name", "")).strip()
+    path1 = bisync_path(payload.get("path1", ""))
+    path2 = bisync_path(payload.get("path2", ""))
+    resync_mode = payload.get("resyncMode", "path1")
+    if not name:
+        raise UserError("Enter a display name")
+    if path1 == path2 or bisync_roots_overlap(path1, path2):
+        raise UserError("Bisync paths must be separate, non-overlapping folders")
+    if resync_mode not in ("path1", "path2", "newer", "older", "larger", "smaller"):
+        raise UserError("Choose a valid resync preference")
+    schedule = payload.get("schedule")
+    if schedule is not None:
+        if not isinstance(schedule, dict):
+            raise UserError("Invalid Bisync schedule")
+        frequency = schedule.get("frequency")
+        time_of_day = schedule.get("time")
+        weekday = schedule.get("weekday", "monday")
+        if frequency not in ("daily", "weekly") or not isinstance(time_of_day, str) or not re.fullmatch(
+                r"(?:[01]\d|2[0-3]):[0-5]\d", time_of_day):
+            raise UserError("Choose a valid daily or weekly Bisync schedule time")
+        if frequency == "weekly" and weekday not in (
+                "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"):
+            raise UserError("Choose a valid weekday for the weekly Bisync schedule")
+        schedule = {"frequency": frequency, "time": time_of_day}
+        if frequency == "weekly":
+            schedule["weekday"] = weekday
+    return {"name": name, "path1": path1, "path2": path2,
+            "resyncMode": resync_mode, "schedule": schedule}
+
+
+def save_bisync(payload):
+    with file_lock(CONFIG / "definitions.lock"):
+        bisyncs = read_list("bisyncs")
+        data = validate_bisync(payload)
+        old = next((entry for entry in bisyncs if entry["id"] == payload.get("id")), None)
+        if payload.get("id") and not old:
+            raise UserError("Bisync folder pair not found")
+        if old and bisync_unit(old) in active_tasks():
+            raise UserError("Stop Bisync before editing this folder pair")
+        if any(entry["id"] != payload.get("id") and any(
+                bisync_roots_overlap(path, existing)
+                for path in (data["path1"], data["path2"])
+                for existing in (entry["path1"], entry["path2"])) for entry in bisyncs):
+            raise UserError("These folders overlap another Bisync pair; overlapping pairs can interfere")
+        port = old.get("port") if old else None
+        if port is None:
+            port = available_port(read_list("mounts"), read_list("tasks"), bisyncs)
+        item = {"id": old["id"] if old else uuid4().hex, **data, "port": port}
+        updated = [item if entry["id"] == item["id"] else entry for entry in bisyncs] if old else bisyncs + [item]
+        write_json(CONFIG / "bisyncs.json", updated)
+        try:
+            sync_bisync_schedule(item)
+        except UserError:
+            write_json(CONFIG / "bisyncs.json", bisyncs)
+            try:
+                sync_bisync_schedule(old or {"id": item["id"], "schedule": None})
+            except UserError:
+                pass
+            raise
+        return {"message": "Bisync folder pair saved; no files were changed"}
+
+
+def delete_bisync(item_id):
+    with file_lock(CONFIG / "definitions.lock"):
+        bisyncs = read_list("bisyncs")
+        item = next((entry for entry in bisyncs if entry["id"] == item_id), None)
+        if not item:
+            raise UserError("Bisync folder pair not found")
+        if bisync_unit(item) in active_tasks():
+            raise UserError("Stop Bisync before removing this folder pair")
+        sync_bisync_schedule({**item, "schedule": None})
+        write_json(CONFIG / "bisyncs.json", [entry for entry in bisyncs if entry["id"] != item_id])
+        key = f"bisync:{item_id}"
+        with file_lock(STATE / "runs.lock"):
+            runs = read_state()
+            runs.pop(key, None)
+            write_json(STATE / "runs.json", runs)
+        return {"message": "Bisync definition removed; both folders and rclone's baseline were left untouched"}
+
+
+def start_bisync(item_id, action):
+    if action not in ("run", "resync"):
+        raise UserError("Unknown Bisync operation")
+    with file_lock(CONFIG / "definitions.lock"):
+        bisyncs = read_list("bisyncs")
+        item = next((entry for entry in bisyncs if entry["id"] == item_id), None)
+        if not item:
+            raise UserError("Bisync folder pair not found")
+        if bisync_unit(item) in active_tasks():
+            raise UserError("This Bisync pair is already running")
+        if "port" not in item:
+            item["port"] = available_port(read_list("mounts"), read_list("tasks"), bisyncs)
+            write_json(CONFIG / "bisyncs.json", bisyncs)
+        key = f"bisync:{item_id}"
+        with file_lock(STATE / "runs.lock"):
+            runs = read_state()
+            previous = runs.get(key, {})
+            if recently_starting(previous):
+                raise UserError("This Bisync pair is already starting; check status in a few seconds")
+            if previous.get("status") in ("Running", "Starting"):
+                previous = {**previous, "status": "Interrupted", "finishedAt": ""}
+            history = record_history(previous)
+            runs[key] = {"history": history, "runId": uuid4().hex, "status": "Starting",
+                         "resyncMode": item["resyncMode"] if action == "resync" else None,
+                         "startedAt": datetime.now(timezone.utc).isoformat(), "finishedAt": "",
+                         "destination": 0, "total": 1, "log": None, "exitCode": None, "failure": None}
+            write_json(STATE / "runs.json", runs)
+        try:
+            command([tool("systemd-run"), "--user", f"--unit={bisync_unit(item)[:-8]}", "--collect",
+                     "--property=UMask=0077", "--property=KillSignal=SIGINT", "--property=TimeoutStopSec=120",
+                     *backend_command("bisync-worker", item_id, action)])
+        except UserError:
+            finish_run(key, "Failed", failure="Could not start Bisync user service")
+            raise
+        if action == "resync":
+            return {"message": f"Resync started; {item['resyncMode']} wins for conflicting files"}
+        return {"message": "Bisync started; changes and deletions may propagate in both directions"}
+
+
+def bisync_worker(item_id, action):
+    key = f"bisync:{item_id}"
+    try:
+        if action not in ("run", "resync"):
+            raise UserError("Unknown Bisync operation")
+        item = next((entry for entry in read_list("bisyncs") if entry["id"] == item_id), None)
+        if not item:
+            raise UserError("Bisync definition missing")
+        for path in (item["path1"], item["path2"]):
+            if path.startswith(("/", "~/")) and not Path(path).expanduser().is_dir():
+                raise UserError("Both local Bisync folders must exist")
+        resync_mode = item["resyncMode"]
+        updated_run(key, status="Running", destination=1, total=1,
+                    resyncMode=resync_mode if action == "resync" else None)
+        args = [tool("rclone"), "bisync", item["path1"], item["path2"],
+                "--transfers", "8", "--checkers", "16", "--stats", "1s",
+                "--stats-one-line", "--rc", "--rc-addr", f"127.0.0.1:{item['port']}"]
+        if action == "resync":
+            args.extend(["--resync", "--resync-mode", resync_mode])
+        if logging_enabled():
+            code, _ = stream_logged(args, item_id, "bisync",
+                                    on_start=lambda path: updated_run(key, log=path))
+        else:
+            code = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+        finish_run(key, "Completed" if code == 0 else "Failed", exitCode=code)
+        return code
+    except (UserError, OSError) as exc:
+        finish_run(key, "Failed", failure="Local setup failed" if isinstance(exc, OSError) else str(exc))
+        return 1
+
+
+def stop_bisync(item_id):
+    item = next((entry for entry in read_list("bisyncs") if entry["id"] == item_id), None)
+    if not item or bisync_unit(item) not in active_tasks():
+        raise UserError("Bisync is not running")
+    command([tool("systemctl"), "--user", "stop", bisync_unit(item)], timeout=130)
+    stopped = finish_run(f"bisync:{item_id}", "Stopped")
+    return {"message": "Bisync stopped gracefully; check its latest result" if stopped else
+            "Bisync had already finished; check its latest result"}
 
 
 def rc_call(port, endpoint):
@@ -704,6 +1007,7 @@ def snapshot():
             "Completed", "Failed", "Stopped", "Interrupted") else run.get("history", [])
         tasks.append({"id": item["id"], "name": item["name"], "action": item["action"],
                       "direction": item["direction"], "destinations": len(item["destinations"]),
+                      "schedule": item.get("schedule"),
                       "running": running, "status": status if running or status != "Starting" else "Starting",
                       "destination": run.get("destination", 0), "total": run.get("total", 0),
                        "reverse": run.get("reverse", False), "startedAt": run.get("startedAt", ""),
@@ -711,7 +1015,31 @@ def snapshot():
                         "failure": run.get("failure"), "log": run.get("log") if run.get("log") and Path(run["log"]).is_file() else None,
                         "history": history,
                        "stats": stats(item["port"]) if running and status == "Running" and "port" in item else None})
-    return {"mounts": mounts, "tasks": tasks, "activeTaskUnits": units}
+    bisyncs = []
+    for item in read_list("bisyncs"):
+        running = bisync_unit(item) in units
+        key = f"bisync:{item['id']}"
+        run = runs.get(key, {})
+        status = run.get("status", "Ready")
+        if status in ("Running", "Starting") and not running and not recently_starting(run):
+            status = "Interrupted"
+        history = record_history({**run, "status": status}) if status in (
+            "Completed", "Failed", "Stopped", "Interrupted") else run.get("history", [])
+        bisyncs.append({"id": item["id"], "name": item["name"], "path1": item["path1"],
+                        "path2": item["path2"], "resyncMode": item.get("resyncMode", "path1"),
+                        "schedule": item.get("schedule"),
+                        "running": running, "status": status if running or status != "Starting" else "Starting",
+                        "startedAt": run.get("startedAt", ""), "finishedAt": run.get("finishedAt", ""),
+                        "exitCode": run.get("exitCode"), "failure": run.get("failure"),
+                        "resyncRun": bool(run.get("resyncMode")),
+                        "log": run.get("log") if run.get("log") and Path(run["log"]).is_file()
+                        else None,
+                        "history": history,
+                        "stats": stats(item["port"]) if running and status == "Running" and "port" in item else None})
+    result = {"mounts": mounts, "tasks": tasks, "activeTaskUnits": units}
+    if bisyncs:
+        result["bisyncs"] = bisyncs
+    return result
 
 
 def main(argv):
@@ -729,6 +1057,14 @@ def main(argv):
     operation = argv[1]
     if operation == "worker":
         return worker(argv[2], argv[3] == "reverse")
+    if operation == "bisync-worker":
+        return bisync_worker(argv[2], argv[3])
+    if operation == "scheduled-run":
+        start_task(argv[2])
+        return 0
+    if operation == "scheduled-bisync-run":
+        start_bisync(argv[2], "run")
+        return 0
     if operation == "mount-worker":
         return mount_worker(argv[2])
     if operation == "snapshot":
@@ -737,26 +1073,35 @@ def main(argv):
         result = diagnostics()
     elif operation == "definitions":
         result = {"mounts": read_list("mounts"), "tasks": read_list("tasks"),
+                  "bisyncs": read_list("bisyncs"),
                   "logging": logging_enabled()}
-    elif operation in ("save-mount", "save-task"):
+    elif operation in ("save-mount", "save-task", "save-bisync"):
         data = json.loads(argv[2])
-        result = save_mount(data) if operation == "save-mount" else save_task(data)
+        result = save_mount(data) if operation == "save-mount" else \
+            save_task(data) if operation == "save-task" else save_bisync(data)
     elif operation == "delete-mount":
         result = delete_mount(argv[2])
     elif operation == "delete-task":
         result = delete_task(argv[2])
+    elif operation == "delete-bisync":
+        result = delete_bisync(argv[2])
     elif operation in ("mount", "unmount", "open"):
         result = operate_mount(argv[2], operation)
     elif operation in ("run", "reverse"):
         result = start_task(argv[2], operation == "reverse")
+    elif operation in ("run-bisync", "resync-bisync"):
+        result = start_bisync(argv[2], "resync" if operation == "resync-bisync" else "run")
     elif operation == "stop":
         result = stop_task(argv[2])
+    elif operation == "stop-bisync":
+        result = stop_bisync(argv[2])
     elif operation == "save-diagnostics":
         result = save_diagnostics(json.loads(argv[2]))
     elif operation == "open-logs":
         result = open_logs()
-    elif operation in ("open-task-log", "open-mount-log"):
-        result = open_logs(argv[2], "task" if operation == "open-task-log" else "mount")
+    elif operation in ("open-task-log", "open-mount-log", "open-bisync-log"):
+        kind = {"open-task-log": "task", "open-mount-log": "mount", "open-bisync-log": "bisync"}[operation]
+        result = open_logs(argv[2], kind)
     else:
         raise UserError("Unknown command")
     print(json.dumps({"ok": True, **result}))

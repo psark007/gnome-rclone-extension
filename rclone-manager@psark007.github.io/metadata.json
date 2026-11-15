@@ -1,0 +1,7 @@
+{
+  "uuid": "rclone-manager@psark007.github.io",
+  "name": "Rclone Manager",
+  "description": "Manage Rclone mounts, transfers, and bidirectional folder pairs.",
+  "settings-schema": "org.gnome.shell.extensions.rclone-manager",
+  "shell-version": ["51"]
+}

@@ -74,7 +74,7 @@ class Menu {
     }
 }
 
-const source = fs.readFileSync(path.join(__dirname, '../rclone-mounts-tasks@psark007.github.io/extension.js'), 'utf8')
+const source = fs.readFileSync(path.join(__dirname, '../rclone-manager@psark007.github.io/extension.js'), 'utf8')
     .replace(/^import .*;\s*$/gm, '')
     .replace('export default class RcloneExtension', 'class RcloneExtension');
 const context = {

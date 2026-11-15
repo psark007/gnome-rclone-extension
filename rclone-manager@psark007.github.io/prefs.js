@@ -70,6 +70,7 @@ export default class RclonePreferences extends ExtensionPreferences {
             this._window.remove(this._settingsPage);
         this._mountEditor = null;
         this._taskEditor = null;
+        this._bisyncEditor = null;
         this._mountPage = new Adw.PreferencesPage({title: 'Mounts', icon_name: 'folder-remote-symbolic'});
         this._taskPage = new Adw.PreferencesPage({title: 'Tasks', icon_name: 'document-send-symbolic'});
         this._diagnosticsPage = new Adw.PreferencesPage({title: 'Diagnostics', icon_name: 'dialog-information-symbolic'});
@@ -78,7 +79,7 @@ export default class RclonePreferences extends ExtensionPreferences {
         this._window.add(this._taskPage);
         this._window.add(this._diagnosticsPage);
         this._window.add(this._settingsPage);
-        const settingsGroup = new Adw.PreferencesGroup({title: 'Storage', description: 'Choose where mount and task definitions, state, logs, and cache are stored. Point Noctalia at this same directory to share data.'});
+        const settingsGroup = new Adw.PreferencesGroup({title: 'Storage', description: 'Choose where mount, task, and Bisync definitions, state, logs, and cache are stored.'});
         const configDir = new Adw.EntryRow({title: 'Data directory', text: this._settings.get_string('config-dir')});
         configDir.connect('notify::text', () => {
             const value = configDir.text.trim();
@@ -112,11 +113,13 @@ export default class RclonePreferences extends ExtensionPreferences {
             this._mountList.add(this._row(mount.label, `${mount.remote} → ${mount.path}`,
                 [this._button('Edit', () => this._mountForm(mount)), remove]));
         }
-        this._taskList = new Adw.PreferencesGroup({title: 'Saved manual tasks',
-            description: 'Copy preserves destination-only files. Sync deletes them. Reverse swaps source and destination for one run.'});
+        this._taskList = new Adw.PreferencesGroup({title: 'Transfer tasks',
+            description: 'Copy preserves destination-only files. Sync deletes them. Bisync propagates changes both ways and can run on a schedule. Resync stays manual. Reverse swaps source and destination for one run.'});
         this._taskPage.add(this._taskList);
-        this._taskList.add(this._row('Add task', 'No transfer starts when saving',
-            [this._button('Add', () => this._taskForm())]));
+        this._taskList.add(this._row('Add a task', 'Saving a definition does not start a transfer', [
+            this._button('Copy / Sync', () => this._taskForm()),
+            this._button('Bisync pair', () => this._bisyncForm()),
+        ]));
         for (const task of data.tasks) {
             let awaiting = false;
             const remove = this._button('Remove', () => {
@@ -127,9 +130,29 @@ export default class RclonePreferences extends ExtensionPreferences {
                 }
                 this._perform('delete-task', task.id);
             }, true);
+            const scheduleText = task.schedule
+                ? ` · ${task.schedule.frequency === 'daily' ? 'Daily' : `Weekly ${task.schedule.weekday}`} at ${task.schedule.time}`
+                : '';
             this._taskList.add(this._row(task.name,
-                `${task.action.toUpperCase()} · ${task.direction} · ${task.source} → ${task.destinations.join('; ')}`,
+                `${task.action.toUpperCase()} · ${task.direction} · ${task.source} → ${task.destinations.join('; ')}${scheduleText}`,
                 [this._button('Edit', () => this._taskForm(task)), remove]));
+        }
+        for (const item of data.bisyncs) {
+            let awaiting = false;
+            const remove = this._button('Remove', () => {
+                if (!awaiting) {
+                    awaiting = true;
+                    remove.label = 'Confirm Remove';
+                    return;
+                }
+                this._perform('delete-bisync', item.id);
+            }, true);
+            const scheduleText = item.schedule
+                ? ` · ${item.schedule.frequency === 'daily' ? 'Daily' : `Weekly ${item.schedule.weekday}`} at ${item.schedule.time}`
+                : '';
+            this._taskList.add(this._row(`${item.name} · BISYNC`,
+                `${item.path1} ↔ ${item.path2} · Resync prefers ${item.resyncMode}${scheduleText}`,
+                [this._button('Edit', () => this._bisyncForm(item)), remove]));
         }
         this._diagnostics();
     }
@@ -147,7 +170,7 @@ export default class RclonePreferences extends ExtensionPreferences {
         }
         group.add(this._row('Installed rclone', data.version, []));
         const logging = new Adw.SwitchRow({title: 'Enable diagnostic logging',
-            subtitle: 'Private, size-limited logs for new mounts and copy/sync runs', active: data.logging});
+            subtitle: 'Private, size-limited logs for new mounts, tasks, and Bisync runs', active: data.logging});
         logging.connect('notify::active', () => this._perform('save-diagnostics',
             JSON.stringify({logging: logging.active})));
         group.add(logging);
@@ -180,6 +203,16 @@ export default class RclonePreferences extends ExtensionPreferences {
                 task.log ? [this._button('Open log', () => this._perform('open-task-log', task.id))] : []));
             if (task.log)
                 summary.add(this._row('Task log location', task.log, []));
+        }
+        for (const item of data.bisyncs || []) {
+            const stats = item.stats
+                ? `${item.stats.bytes ?? '?'} bytes, ${item.stats.speed ?? '?'} B/s, ${item.stats.errors ?? '?'} errors, ${item.stats.transfers ?? '?'} transfers`
+                : 'transfer statistics unavailable';
+            summary.add(this._row(`Bisync · ${item.name}`,
+                `${item.status} · ${item.path1} ↔ ${item.path2} · ${stats}`,
+                item.log ? [this._button('Open log', () => this._perform('open-bisync-log', item.id))] : []));
+            if (item.log)
+                summary.add(this._row('Bisync log location', item.log, []));
         }
     }
 
@@ -259,8 +292,22 @@ export default class RclonePreferences extends ExtensionPreferences {
         const direction = this._choice('Direction', ['Local → remote (upload)', 'Remote → local (download)'],
             task?.direction === 'download' ? 1 : 0);
         const source = this._entry('Source (local path or remote:path)', task?.source || '');
-        for (const row of [name, action, direction, source])
+        const schedule = task?.schedule;
+        const frequency = this._choice('Automatic schedule', ['Off', 'Daily', 'Weekly'],
+            schedule?.frequency === 'daily' ? 1 : schedule?.frequency === 'weekly' ? 2 : 0);
+        frequency.subtitle = 'Runs at local time; a missed run is caught up when the user session returns. Scheduled sync can delete destination-only files.';
+        const time = this._entry('Time (24-hour local time, HH:MM)', schedule?.time || '09:00');
+        const weekdays = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+        const weekday = this._choice('Day of week', weekdays,
+            Math.max(0, weekdays.findIndex(day => day.toLowerCase() === schedule?.weekday)));
+        for (const row of [name, action, direction, source, frequency, time, weekday])
             group.add(row);
+        time.visible = frequency.selected !== 0;
+        weekday.visible = frequency.selected === 2;
+        frequency.connect('notify::selected', () => {
+            time.visible = frequency.selected !== 0;
+            weekday.visible = frequency.selected === 2;
+        });
         const destinations = new Gtk.TextView({wrap_mode: Gtk.WrapMode.NONE, monospace: true,
             top_margin: 8, bottom_margin: 8, left_margin: 8, right_margin: 8});
         destinations.buffer.set_text((task?.destinations || []).join('\n'), -1);
@@ -275,11 +322,69 @@ export default class RclonePreferences extends ExtensionPreferences {
                 this._perform('save-task', JSON.stringify({id: task?.id, name: name.text,
                     action: action.selected === 1 ? 'sync' : 'copy',
                     direction: direction.selected === 1 ? 'download' : 'upload',
-                    source: source.text, destinations: lines}));
+                    source: source.text, destinations: lines,
+                    schedule: frequency.selected === 0 ? null : {
+                        frequency: frequency.selected === 1 ? 'daily' : 'weekly',
+                        time: time.text.trim(),
+                        ...(frequency.selected === 2 ? {weekday: weekdays[weekday.selected].toLowerCase()} : {}),
+                    }}));
             }),
             this._button('Cancel', () => {
                 this._taskPage.remove(group);
                 this._taskEditor = null;
+            }),
+        ]));
+    }
+
+    _bisyncForm(item = null) {
+        if (this._bisyncEditor)
+            this._taskPage.remove(this._bisyncEditor);
+        const group = new Adw.PreferencesGroup({title: item ? 'Edit Bisync pair' : 'Add Bisync pair',
+            description: 'Both base folders must already exist. Save does not start a transfer; schedule normal runs or use Resync explicitly to create the initial baseline.'});
+        this._taskPage.add(group);
+        this._bisyncEditor = group;
+        const name = this._entry('Display name', item?.name || '');
+        const path1 = this._entry('Path 1 (absolute local folder or remote:path)', item?.path1 || '');
+        const path2 = this._entry('Path 2 (absolute local folder or remote:path)', item?.path2 || '');
+        const modes = ['Path 1', 'Path 2', 'Newer', 'Older', 'Larger', 'Smaller'];
+        const modeValues = ['path1', 'path2', 'newer', 'older', 'larger', 'smaller'];
+        const mode = this._choice('Resync conflict preference', modes,
+            Math.max(0, modeValues.indexOf(item?.resyncMode || 'path1')));
+        mode.subtitle = 'Only applies to Resync. Existing bisync runs use the saved baseline.';
+        const schedule = item?.schedule;
+        const frequency = this._choice('Automatic schedule', ['Off', 'Daily', 'Weekly'],
+            schedule?.frequency === 'daily' ? 1 : schedule?.frequency === 'weekly' ? 2 : 0);
+        frequency.subtitle = 'Create the baseline with Resync before the first scheduled run. The timer runs normal Bisync only; Resync is always manual. Changes and deletions propagate both ways.';
+        const time = this._entry('Time (24-hour local time, HH:MM)', schedule?.time || '09:00');
+        const weekdays = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+        const weekday = this._choice('Day of week', weekdays,
+            Math.max(0, weekdays.findIndex(day => day.toLowerCase() === schedule?.weekday)));
+        for (const row of [name, path1, path2, mode, frequency, time, weekday])
+            group.add(row);
+        time.visible = frequency.selected !== 0;
+        weekday.visible = frequency.selected === 2;
+        frequency.connect('notify::selected', () => {
+            time.visible = frequency.selected !== 0;
+            weekday.visible = frequency.selected === 2;
+        });
+        group.add(this._row('Bisync safety',
+            'Regular runs propagate changes and deletions both ways. Resync can overwrite same-named files according to the selected preference. Back up important data first.', []));
+        group.add(this._row('Save definition', 'This does not change either folder', [
+            this._button('Save', () => this._perform('save-bisync', JSON.stringify({
+                id: item?.id,
+                name: name.text,
+                path1: path1.text,
+                path2: path2.text,
+                resyncMode: modeValues[mode.selected],
+                schedule: frequency.selected === 0 ? null : {
+                    frequency: frequency.selected === 1 ? 'daily' : 'weekly',
+                    time: time.text.trim(),
+                    ...(frequency.selected === 2 ? {weekday: weekdays[weekday.selected].toLowerCase()} : {}),
+                },
+            }))),
+            this._button('Cancel', () => {
+                this._taskPage.remove(group);
+                this._bisyncEditor = null;
             }),
         ]));
     }
