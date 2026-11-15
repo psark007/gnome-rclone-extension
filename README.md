@@ -89,6 +89,9 @@ The panel indicator shows counts such as `2M 1T`; zero values are omitted. Its
 icon switches to transfer arrows while a transfer runs. Mounts and Tasks have
 separate popup tabs, with Bisync pairs listed under Tasks.
 
+Drag the handle beside a saved entry in Preferences to change the order of
+mounts, copy/sync tasks, or Bisync pairs. The panel follows that order.
+
 Mounts, tasks, and Bisync runs use transient `systemd --user` services.
 Disabling the extension does not stop them. Stop active work and unmount
 explicitly.
@@ -142,7 +145,7 @@ runs are captured under `.state/logs/` in the selected data directory. The
 directory is mode 0700, logs are mode 0600, each log is limited to 1 MiB, and
 retained logs are limited to 16 MiB total. Older output may be omitted to keep
 the recent tail. Turn logging on before reproducing an issue. Use **Open logs
-folder** in Preferences or **Open log** on a panel entry.
+folder** or an entry's **Open log** action in **Preferences → Diagnostics**.
 
 Logs may contain filenames, paths, and provider errors; review them before
 sharing. The extension does not request HTTP dumps, headers, auth traces, or

@@ -1,5 +1,8 @@
 import Adw from 'gi://Adw';
+import Gdk from 'gi://Gdk';
 import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
+import GObject from 'gi://GObject';
 import Gtk from 'gi://Gtk';
 
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
@@ -9,8 +12,46 @@ export default class RclonePreferences extends ExtensionPreferences {
         this._window = window;
         this._helper = `${this.path}/backend.py`;
         this._settings = this.getSettings();
+        this._installReorderStyle();
         window.set_default_size(660, 650);
         this._render();
+    }
+
+    _installReorderStyle() {
+        if (this._reorderCssProvider)
+            return;
+        const provider = new Gtk.CssProvider();
+        const css = `
+            .rclone-drag-handle {
+                background-color: transparent;
+                border: none;
+                box-shadow: none;
+                opacity: 0.45;
+                padding: 2px;
+            }
+            .rclone-drag-handle:hover,
+            .rclone-drag-handle:focus {
+                background-color: transparent;
+                box-shadow: none;
+                opacity: 0.8;
+            }
+            .rclone-reorder-row {
+                transition: background-color 180ms ease-out, opacity 120ms ease-out;
+            }
+            .rclone-reorder-row.rclone-dragging {
+                opacity: 0.35;
+            }
+            .rclone-reorder-row.rclone-reordered {
+                background-color: alpha(@accent_bg_color, 0.12);
+            }
+            .rclone-reorder-row:drop(active) {
+                background-color: alpha(@accent_bg_color, 0.18);
+            }
+        `;
+        provider.load_from_data(css, -1);
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
+        this._reorderCssProvider = provider;
     }
 
     _call(...args) {
@@ -59,6 +100,100 @@ export default class RclonePreferences extends ExtensionPreferences {
         return row;
     }
 
+    _makeReorderable(row, collection, id) {
+        const handle = new Gtk.Button({child: new Gtk.Image({
+            icon_name: 'list-drag-handle-symbolic', pixel_size: 12,
+        })});
+        handle.add_css_class('flat');
+        handle.add_css_class('rclone-drag-handle');
+        handle.set_tooltip_text('Drag to reorder');
+        handle.set_cursor_from_name('grab');
+        handle.update_property([Gtk.AccessibleProperty.LABEL], ['Drag to reorder']);
+        const source = Gtk.DragSource.new();
+        source.set_actions(Gdk.DragAction.MOVE);
+        source.connect('prepare', () => Gdk.ContentProvider.new_for_value(JSON.stringify({collection, id})));
+        source.connect('drag-begin', () => {
+            row.add_css_class('rclone-dragging');
+            source.set_icon(Gtk.WidgetPaintable.new(row), 0, 0);
+        });
+        source.connect('drag-end', () => row.remove_css_class('rclone-dragging'));
+        source.connect('drag-cancel', () => row.remove_css_class('rclone-dragging'));
+        handle.add_controller(source);
+        row.add_prefix(handle);
+        row.add_css_class('rclone-reorder-row');
+        this._reorderRows.set(JSON.stringify([collection, id]), row);
+
+        const target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE);
+        target.connect('drop', (_target, value, _x, y) => {
+            try {
+                const dragged = JSON.parse(value);
+                if (dragged.collection !== collection || dragged.id === id)
+                    return false;
+                const position = y < row.get_height() / 2 ? 'before' : 'after';
+                GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                    const moved = this._moveReorderableRow(collection, dragged.id, id, position);
+                    this._saveReorder(collection, dragged.id, id, position, moved);
+                    return GLib.SOURCE_REMOVE;
+                });
+                return true;
+            } catch (error) {
+                return false;
+            }
+        });
+        row.add_controller(target);
+    }
+
+    _moveReorderableRow(collection, sourceId, targetId, position) {
+        const source = this._reorderRows.get(JSON.stringify([collection, sourceId]));
+        const target = this._reorderRows.get(JSON.stringify([collection, targetId]));
+        if (!source || !target || source === target || source.get_parent() !== target.get_parent())
+            return false;
+        const list = source.get_parent();
+        if (typeof list.insert !== 'function' || typeof list.remove !== 'function')
+            return false;
+        const sourceIndex = source.get_index();
+        const targetIndex = target.get_index();
+        let insertAt = targetIndex + (position === 'after' ? 1 : 0);
+        list.remove(source);
+        if (sourceIndex < insertAt)
+            insertAt--;
+        list.insert(source, insertAt);
+        source.add_css_class('rclone-reordered');
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 220, () => {
+            source.remove_css_class('rclone-reordered');
+            return GLib.SOURCE_REMOVE;
+        });
+        return true;
+    }
+
+    _saveReorder(collection, sourceId, targetId, position, movedInPlace) {
+        let process;
+        try {
+            process = Gio.Subprocess.new(['/usr/bin/python3', this._helper,
+                '--config-dir', this._settings.get_string('config-dir'),
+                'reorder-entry', collection, sourceId, targetId, position],
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+        } catch (error) {
+            this._notice(error.message);
+            this._render();
+            return;
+        }
+        process.communicate_utf8_async(null, null, (proc, result) => {
+            try {
+                const [, output] = proc.communicate_utf8_finish(result);
+                const data = JSON.parse(output);
+                if (!proc.get_successful() || !data.ok)
+                    throw new Error(data.error || 'Could not save the new order');
+                this._notice(data.message);
+                if (!movedInPlace)
+                    this._render();
+            } catch (error) {
+                this._notice(error.message);
+                this._render();
+            }
+        });
+    }
+
     _render() {
         if (this._mountPage)
             this._window.remove(this._mountPage);
@@ -71,6 +206,7 @@ export default class RclonePreferences extends ExtensionPreferences {
         this._mountEditor = null;
         this._taskEditor = null;
         this._bisyncEditor = null;
+        this._reorderRows = new Map();
         this._mountPage = new Adw.PreferencesPage({title: 'Mounts', icon_name: 'folder-remote-symbolic'});
         this._taskPage = new Adw.PreferencesPage({title: 'Tasks', icon_name: 'document-send-symbolic'});
         this._diagnosticsPage = new Adw.PreferencesPage({title: 'Diagnostics', icon_name: 'dialog-information-symbolic'});
@@ -110,8 +246,10 @@ export default class RclonePreferences extends ExtensionPreferences {
                 }
                 this._perform('delete-mount', mount.id);
             }, true);
-            this._mountList.add(this._row(mount.label, `${mount.remote} → ${mount.path}`,
-                [this._button('Edit', () => this._mountForm(mount)), remove]));
+            const row = this._row(mount.label, `${mount.remote} → ${mount.path}`,
+                [this._button('Edit', () => this._mountForm(mount)), remove]);
+            this._makeReorderable(row, 'mounts', mount.id);
+            this._mountList.add(row);
         }
         this._taskList = new Adw.PreferencesGroup({title: 'Transfer tasks',
             description: 'Copy preserves destination-only files. Sync deletes them. Bisync propagates changes both ways and can run on a schedule. Resync stays manual. Reverse swaps source and destination for one run.'});
@@ -133,9 +271,11 @@ export default class RclonePreferences extends ExtensionPreferences {
             const scheduleText = task.schedule
                 ? ` · ${task.schedule.frequency === 'daily' ? 'Daily' : `Weekly ${task.schedule.weekday}`} at ${task.schedule.time}`
                 : '';
-            this._taskList.add(this._row(task.name,
+            const row = this._row(task.name,
                 `${task.action.toUpperCase()} · ${task.direction} · ${task.source} → ${task.destinations.join('; ')}${scheduleText}`,
-                [this._button('Edit', () => this._taskForm(task)), remove]));
+                [this._button('Edit', () => this._taskForm(task)), remove]);
+            this._makeReorderable(row, 'tasks', task.id);
+            this._taskList.add(row);
         }
         for (const item of data.bisyncs) {
             let awaiting = false;
@@ -150,9 +290,11 @@ export default class RclonePreferences extends ExtensionPreferences {
             const scheduleText = item.schedule
                 ? ` · ${item.schedule.frequency === 'daily' ? 'Daily' : `Weekly ${item.schedule.weekday}`} at ${item.schedule.time}`
                 : '';
-            this._taskList.add(this._row(`${item.name} · BISYNC`,
+            const row = this._row(`${item.name} · BISYNC`,
                 `${item.path1} ↔ ${item.path2} · Resync prefers ${item.resyncMode}${scheduleText}`,
-                [this._button('Edit', () => this._bisyncForm(item)), remove]));
+                [this._button('Edit', () => this._bisyncForm(item)), remove]);
+            this._makeReorderable(row, 'bisyncs', item.id);
+            this._taskList.add(row);
         }
         this._diagnostics();
     }

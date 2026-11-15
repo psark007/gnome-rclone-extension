@@ -497,6 +497,25 @@ def delete_mount(item_id):
         return {"message": "Saved entry removed; cache and remote files were left untouched"}
 
 
+def reorder_entry(collection, item_id, target_id, position):
+    files = {"mounts": "mounts", "tasks": "tasks", "bisyncs": "bisyncs"}
+    if collection not in files or position not in ("before", "after"):
+        raise UserError("Invalid list reorder request")
+    with file_lock(CONFIG / "definitions.lock"):
+        entries = read_list(files[collection])
+        source_index = next((i for i, entry in enumerate(entries) if entry.get("id") == item_id), None)
+        if source_index is None:
+            raise UserError("Entry not found")
+        entry = entries.pop(source_index)
+        target_index = next((i for i, current in enumerate(entries) if current.get("id") == target_id), None)
+        if target_index is None:
+            raise UserError("Drop target not found")
+        insert_at = target_index if position == "before" else target_index + 1
+        entries.insert(insert_at, entry)
+        write_json(CONFIG / f"{files[collection]}.json", entries)
+        return {"message": "Order saved"}
+
+
 def operate_mount(item_id, action):
     if action == "open":
         return _operate_mount(item_id, action)
@@ -1085,6 +1104,8 @@ def main(argv):
         result = delete_task(argv[2])
     elif operation == "delete-bisync":
         result = delete_bisync(argv[2])
+    elif operation == "reorder-entry":
+        result = reorder_entry(argv[2], argv[3], argv[4], argv[5])
     elif operation in ("mount", "unmount", "open"):
         result = operate_mount(argv[2], operation)
     elif operation in ("run", "reverse"):

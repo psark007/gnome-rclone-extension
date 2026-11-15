@@ -329,15 +329,11 @@ class Indicator extends PanelMenu.Button {
                                 this._message = 'Unmount request cancelled; mount still running.';
                                 this._draw();
                             }}] : []),
-                        ...(mount.log ? [{icon: 'text-x-generic-symbolic', name: `Open ${mount.label} log`,
-                            activate: () => this._action('open-mount-log', mount.id)}] : []),
                     ]
                     : [{label: mount.status === 'Starting' ? 'Starting…' : 'Mount',
                         kind: 'primary',
                         enabled: mount.status !== 'Starting',
-                        activate: () => this._action('mount', mount.id)},
-                    ...(mount.log ? [{icon: 'text-x-generic-symbolic', name: `Open ${mount.label} log`,
-                        activate: () => this._action('open-mount-log', mount.id)}] : [])];
+                        activate: () => this._action('mount', mount.id)}];
                 this._row(mount.label, details, controls);
             }
         } else {
@@ -403,9 +399,6 @@ class Indicator extends PanelMenu.Button {
                 } else if (!task.running && !details.length) {
                     details.push('Never run');
                 }
-                if (task.log)
-                    controls.push({icon: 'text-x-generic-symbolic', name: `Open ${task.name} log`,
-                        activate: () => this._action('open-task-log', task.id)});
                 this._row(`${task.name} · ${task.action.toUpperCase()} · ${task.status}`, details, controls);
             }
             if (bisyncs.length) {
@@ -463,9 +456,6 @@ class Indicator extends PanelMenu.Button {
                 } else if (!item.running && item.status === 'Ready') {
                     details.push(`Resync preference: ${item.resyncMode}`);
                 }
-                if (item.log)
-                    controls.push({icon: 'text-x-generic-symbolic', name: `Open ${item.name} log`,
-                        activate: () => this._action('open-bisync-log', item.id)});
                 this._row(`${item.name} · BISYNC · ${item.status}`, details, controls);
             }
         }
